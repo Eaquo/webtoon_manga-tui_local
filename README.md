@@ -191,6 +191,12 @@ L'application crée automatiquement `~/.config/manga_reader/config.json` :
 - Vérifiez que `unrar` et `poppler-utils` sont installés
 - Assurez-vous que le fichier CBR/CBZ/PDF est valide
 
+## ☕ Support
+
+If you like this project, consider buying me a coffee!
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/waxdred)
+
 ## 📄 Licence
 
 Ce projet est distribué sous la licence MIT. Voir le fichier [LICENSE](LICENSE) pour plus de détails.
