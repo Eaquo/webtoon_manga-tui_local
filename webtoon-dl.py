@@ -62,6 +62,25 @@ args = parser.parse_args()
 # ---------------------------------------------------------------------------
 TUI = args.tui
 
+# Les pages sont servies en lazy-load : l'URL réelle vit dans data-src et la
+# balise n'a souvent aucun attribut src. On teste donc tous les attributs
+# connus, et on nettoie les espaces parasites (mangas-origines préfixe ses
+# data-src d'une espace, ce qui casse un simple startswith("http")).
+LAZY_ATTRS = ("data-src", "src", "data-lazy-src", "data-cfsrc")
+
+# Largeur minimale d'une vraie planche, en pixels. Sert de garde-fou : si le
+# site change encore de structure et qu'on récupère des avatars (150x150) ou
+# un logo, on échoue franchement au lieu d'écrire une archive inutilisable.
+MIN_PAGE_WIDTH = 300
+
+def img_src(tag):
+    """Retourne la première URL exploitable d'une balise <img>, ou None."""
+    for attr in LAZY_ATTRS:
+        value = tag.get(attr)
+        if value and value.strip():
+            return value.strip()
+    return None
+
 def say(message: str) -> None:
     """Affiche une ligne destinee a un humain (log lisible)."""
     sys.stdout.write(message + "\n")
@@ -394,12 +413,7 @@ for idx, current_chapter in enumerate(chapters, 1):
                                     soup_first_page.find('img', src=re.compile(r'/WP-manga/data/'))
                             
                             if img_tag:
-                                img_url = (
-                                    img_tag.get('data-src') or
-                                    img_tag.get('src') or
-                                    img_tag.get('data-lazy-src') or
-                                    img_tag.get('data-cfsrc')
-                                )
+                                img_url = img_src(img_tag)
                                 if img_url and '/WP-manga/data/' in img_url:
                                     # Extraire le chemin de base (jusqu'au dossier contenant les images)
                                     base_image_url = '/'.join(img_url.split('/')[:-1]) + '/'
@@ -433,12 +447,7 @@ for idx, current_chapter in enumerate(chapters, 1):
                                         soup_page.find('img', src=re.compile(r'/WP-manga/data/'))
                                 
                                 if img_tag:
-                                    img_url = (
-                                        img_tag.get('data-src') or
-                                        img_tag.get('src') or
-                                        img_tag.get('data-lazy-src') or
-                                        img_tag.get('data-cfsrc')
-                                    )
+                                    img_url = img_src(img_tag)
                                     if img_url:
                                         if not img_url.startswith("http"):
                                             img_url = urllib.parse.urljoin(page_url, img_url)
@@ -456,27 +465,28 @@ for idx, current_chapter in enumerate(chapters, 1):
                             time.sleep(0.2)  # Pause pour éviter de surcharger le serveur
             
             if not is_manga_mode or not img_urls:
-                # Mode Webcomic ou fallback : récupérer toutes les images depuis la page principale
-                img_tags = [img for img in soup.find_all('img') if "/uploads/" in (img.get('src') or '')]
-                if len(img_tags) <= 1:
-                    print(f"⚠️ No valid images for Chapter {current_chapter}")
-                    sys.stdout.write(f"No valid images for Chapter {current_chapter}\n")
-                    sys.stdout.flush()
-                    downloaded_chapters.append((current_chapter, f"Chapitre_{current_chapter:03d}", "Failed: No images"))
-                    continue
-                img_tags = img_tags[1:]  # Ignorer la première image
+                # Mode Webcomic ou repli : on cible les balises du lecteur.
+                # Filtrer sur "/uploads/" ne suffit pas — sur ce WordPress, le
+                # logo, les avatars des commentaires et les vignettes « à lire
+                # aussi » vivent aussi sous /uploads/. Les vraies planches sont
+                # les seules servies depuis /WP-manga/data/.
+                candidates = soup.find_all('img', class_='wp-manga-chapter-img')
+                if not candidates:
+                    candidates = soup.find_all('img')
 
-                for img in img_tags:
-                    img_url = (
-                        img.get('data-src') or
-                        img.get('src') or
-                        img.get('data-lazy-src') or
-                        img.get('data-cfsrc')
-                    )
-                    if img_url:
-                        if not img_url.startswith("http"):
-                            img_url = urllib.parse.urljoin(url, img_url)
-                        img_urls.append(img_url)
+                seen = set()
+                for img in candidates:
+                    img_url = img_src(img)
+                    if not img_url:
+                        continue
+                    if not img_url.startswith("http"):
+                        img_url = urllib.parse.urljoin(url, img_url)
+                    if "/WP-manga/data/" not in img_url:
+                        continue  # habillage du site, pas une planche
+                    if img_url in seen:
+                        continue
+                    seen.add(img_url)
+                    img_urls.append(img_url)
         
         else:  # anime-sama.fr
             # [Code existant pour anime-sama.fr inchangé]
@@ -517,6 +527,7 @@ for idx, current_chapter in enumerate(chapters, 1):
 
         # Télécharger les images
         final_images = []
+        skipped_small = 0
         for i, img_url in enumerate(img_urls, 1):
             ext = os.path.splitext(img_url)[-1].split('?')[0]
             if ext.lower() not in ['.jpg', '.jpeg', '.png', '.webp']:
@@ -529,6 +540,15 @@ for idx, current_chapter in enumerate(chapters, 1):
                 try:
                     img_data = scraper.get(img_url).content
                     img = Image.open(io.BytesIO(img_data))
+
+                    # Une planche fait au moins MIN_PAGE_WIDTH px de large.
+                    # En dessous, c'est de l'habillage (avatar, logo, icône) :
+                    # on refuse de l'archiver comme si c'était du contenu.
+                    if img.width < MIN_PAGE_WIDTH:
+                        skipped_small += 1
+                        success = True  # inutile de réessayer, l'URL est valide
+                        break
+
                     if img.mode != "RGB":
                         img = img.convert("RGB")
 
@@ -570,8 +590,12 @@ for idx, current_chapter in enumerate(chapters, 1):
             time.sleep(0.2)
 
         if not final_images:
-            say(f"⚠️ Chapitre {current_chapter} : aucune image téléchargée")
-            evt("chapter_failed", num=current_chapter, reason="aucune image")
+            if skipped_small:
+                reason = f"{skipped_small} image(s) écartée(s) car trop petites — le site a probablement changé de structure"
+            else:
+                reason = "aucune image"
+            say(f"⚠️ Chapitre {current_chapter} : {reason}")
+            evt("chapter_failed", num=current_chapter, reason=reason)
             downloaded_chapters.append((current_chapter, f"Chapitre_{current_chapter:03d}", "Failed: No images downloaded"))
             continue
 
@@ -581,6 +605,8 @@ for idx, current_chapter in enumerate(chapters, 1):
             for img in final_images:
                 myzip.write(img, os.path.basename(img))
 
+        if skipped_small:
+            say(f"⚠️ Chapitre {current_chapter} : {skipped_small} image(s) ignorée(s) (trop petites)")
         say(f"✅ Chapitre_{current_chapter:03d}.cbz créé ({len(final_images)} image(s))")
         evt("chapter_done", num=current_chapter, images=len(final_images))
         downloaded_chapters.append((current_chapter, f"Chapitre_{current_chapter:03d}", "Success"))
