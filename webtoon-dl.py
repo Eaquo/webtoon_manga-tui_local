@@ -41,6 +41,11 @@ parser.add_argument(
     help="Chapters to download (e.g., 1-3,5)"
 )
 parser.add_argument(
+    "--tui",
+    action="store_true",
+    help="Emit machine-readable progress events for manga-reader (hides verbose logs)"
+)
+parser.add_argument(
     "-o",
     "--output-dir",
     type=str,
@@ -48,6 +53,29 @@ parser.add_argument(
     help=f"Directory where manga folders and cache will be created (default: {default_output_dir})"
 )
 args = parser.parse_args()
+
+# ---------------------------------------------------------------------------
+# Sortie : une ligne humaine lisible + (si --tui) un evenement structure que
+# manga-reader parse pour sa barre de progression. Un evenement = une ligne
+#   @EVT|<type>|cle=valeur|cle=valeur
+# Les lignes @EVT ne sont jamais affichees dans le panneau de logs du TUI.
+# ---------------------------------------------------------------------------
+TUI = args.tui
+
+def say(message: str) -> None:
+    """Affiche une ligne destinee a un humain (log lisible)."""
+    sys.stdout.write(message + "\n")
+    sys.stdout.flush()
+
+def evt(kind: str, **fields) -> None:
+    """Emet un evenement structure pour le TUI (ignore en mode CLI)."""
+    if not TUI:
+        return
+    parts = ["@EVT", kind]
+    for key, value in fields.items():
+        parts.append(f"{key}={str(value).replace('|', '/')}")
+    sys.stdout.write("|".join(parts) + "\n")
+    sys.stdout.flush()
 
 # Création des répertoires
 output_dir = os.path.expanduser(args.output_dir)
@@ -106,7 +134,8 @@ except ValueError:
     exit(1)
 
 # Afficher le résumé initial
-print(f"Downloading {len(chapters)} chapters to {max(chapters)}")
+say(f"🎯 {len(chapters)} chapitre(s) à télécharger : {min(chapters)} → {max(chapters)}")
+evt("plan", total=len(chapters), first=min(chapters), last=max(chapters))
 
 # Initialisation du scraper
 scraper = cloudscraper.create_scraper()
@@ -142,10 +171,8 @@ try:
         
         manga_name = manga_name.replace(" ", "_") if manga_name else "Manga"
         
-    print(f"📖 Manga détecté: {manga_name.replace('_', ' ')}")
-    sys.stdout.write(f"📖 Manga en cours de téléchargement: {manga_name.replace('_', ' ')}\n")
-    sys.stdout.write(f"🎯 Nombre de chapitres à télécharger: {len(chapters)}\n")
-    sys.stdout.flush()
+    say(f"📖 Manga : {manga_name.replace('_', ' ')}")
+    evt("manga", name=manga_name.replace('_', ' '), total=len(chapters))
 except Exception as e:
     print(f"⚠️ Error fetching manga name: {e}")
     manga_name = "Manga"
@@ -153,7 +180,8 @@ except Exception as e:
 # Création des dossiers
 manga_dir = os.path.join(output_dir, manga_name)
 cache_dir = os.path.join(output_dir, "cache")
-print(f"📁 Manga Folder: {manga_dir}")
+say(f"📁 Dossier : {manga_dir}")
+evt("folder", path=manga_dir)
 os.makedirs(manga_dir, exist_ok=True)
 os.makedirs(cache_dir, exist_ok=True)
 
@@ -284,10 +312,8 @@ else:
 downloaded_chapters: List[Tuple[int, str, str]] = []
 
 for idx, current_chapter in enumerate(chapters, 1):
-    print(f"Downloading Chapter {current_chapter} ({idx}/{len(chapters)})")
-    sys.stdout.write(f"📥 Chapitre {current_chapter}: Début du téléchargement ({idx}/{len(chapters)})\n")
-    sys.stdout.write(f"📊 Progression globale: {((idx - 1) / len(chapters) * 100):.1f}%\n")
-    sys.stdout.flush()
+    say(f"📥 Chapitre {current_chapter} ({idx}/{len(chapters)})")
+    evt("chapter_start", num=current_chapter, idx=idx, total=len(chapters))
     time.sleep(0.1)  # Délai pour permettre à Rust de capturer les logs
 
     # Réinitialiser le cache
@@ -302,9 +328,8 @@ for idx, current_chapter in enumerate(chapters, 1):
             url = base_url + str(current_chapter) + "/"
             r = scraper.get(url)
             if r.status_code != 200:
-                print(f"❌ Chapter page not accessible: {url}")
-                sys.stdout.write(f"Chapter {current_chapter} failed: Page not accessible\n")
-                sys.stdout.flush()
+                say(f"❌ Chapitre {current_chapter} : page inaccessible ({url})")
+                evt("chapter_failed", num=current_chapter, reason="page inaccessible")
                 downloaded_chapters.append((current_chapter, f"Chapitre_{current_chapter:03d}", "Failed: Page not accessible"))
                 continue
 
@@ -486,10 +511,8 @@ for idx, current_chapter in enumerate(chapters, 1):
             downloaded_chapters.append((current_chapter, f"Chapitre_{current_chapter:03d}", "Failed: No images"))
             continue
 
-        print(f"Found {len(img_urls)} images for Chapter {current_chapter}")
-        sys.stdout.write(f"🔍 Trouvé {len(img_urls)} images pour le Chapitre {current_chapter}\n")
-        sys.stdout.write(f"📥 Début du téléchargement des images...\n")
-        sys.stdout.flush()
+        say(f"🔍 Chapitre {current_chapter} : {len(img_urls)} image(s) trouvée(s)")
+        evt("images", num=current_chapter, count=len(img_urls))
         time.sleep(0.1)
 
         # Télécharger les images
@@ -528,9 +551,9 @@ for idx, current_chapter in enumerate(chapters, 1):
                     
                     final_images.append(filename_jpg)
                     progress = (i / len(img_urls)) * 100
-                    print(f"Downloaded image {i}/{len(img_urls)} for Chapter {current_chapter}")
-                    sys.stdout.write(f"📄 Image {i}/{len(img_urls)} téléchargée ({progress:.1f}% du chapitre)\n")
-                    sys.stdout.flush()
+                    evt("image", num=current_chapter, i=i, n=len(img_urls))
+                    if not TUI:
+                        say(f"📄 Image {i}/{len(img_urls)} ({progress:.1f}%)")
                     success = True
                     break
                 except Exception as e:
@@ -547,9 +570,8 @@ for idx, current_chapter in enumerate(chapters, 1):
             time.sleep(0.2)
 
         if not final_images:
-            print(f"⚠️ No images downloaded for Chapter {current_chapter}")
-            sys.stdout.write(f"No images downloaded for Chapter {current_chapter}\n")
-            sys.stdout.flush()
+            say(f"⚠️ Chapitre {current_chapter} : aucune image téléchargée")
+            evt("chapter_failed", num=current_chapter, reason="aucune image")
             downloaded_chapters.append((current_chapter, f"Chapitre_{current_chapter:03d}", "Failed: No images downloaded"))
             continue
 
@@ -559,9 +581,8 @@ for idx, current_chapter in enumerate(chapters, 1):
             for img in final_images:
                 myzip.write(img, os.path.basename(img))
 
-        print(f"✅ Chapitre_{current_chapter:03d}.cbr created with {len(final_images)} image(s).")
-        sys.stdout.write(f"Chapitre_{current_chapter:03d}.cbr created with {len(final_images)} image(s).\n")
-        sys.stdout.flush()
+        say(f"✅ Chapitre_{current_chapter:03d}.cbz créé ({len(final_images)} image(s))")
+        evt("chapter_done", num=current_chapter, images=len(final_images))
         downloaded_chapters.append((current_chapter, f"Chapitre_{current_chapter:03d}", "Success"))
 
         # Nettoyage
@@ -570,16 +591,15 @@ for idx, current_chapter in enumerate(chapters, 1):
         time.sleep(1)
 
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
-        sys.stdout.write(f"Unexpected error: {e}\n")
-        sys.stdout.flush()
+        say(f"❌ Chapitre {current_chapter} : erreur inattendue ({e})")
+        evt("chapter_failed", num=current_chapter, reason=str(e))
         downloaded_chapters.append((current_chapter, f"Chapitre_{current_chapter:03d}", f"Failed: {e}"))
 
 # Résumé final
-print("\n🎉 Download Complete!")
-sys.stdout.write("✅ Téléchargement terminé!\n")
-sys.stdout.write(f"🎉 Résumé: {len([c for c in downloaded_chapters if 'Success' in c[2]])} chapitres téléchargés avec succès\n")
-sys.stdout.flush()
+_ok = len([c for c in downloaded_chapters if 'Success' in c[2]])
+_ko = len(downloaded_chapters) - _ok
+say(f"🎉 Terminé : {_ok} chapitre(s) téléchargé(s)" + (f", {_ko} en échec" if _ko else ""))
+evt("done", ok=_ok, failed=_ko)
 
 if downloaded_chapters:
     print("📋 Résumé du téléchargement:")

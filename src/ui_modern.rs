@@ -750,23 +750,53 @@ fn draw_modern_downloading(f: &mut Frame, app: &mut App, area: Rect, colors: &Wa
     .alignment(Alignment::Center);
     f.render_widget(header_widget, download_layout[0]);
 
-    // 🎯 Section de progression détaillée et élégante
+    // 🎯 Deux barres : avancement global, puis avancement du chapitre en cours.
     let progress_percent = progress;
-    let progress_bar = colors.create_subtle_progress_bar(progress_percent / 100.0, 30, ProgressStyle::Blocks);
-    
+    let chapter_ratio = app.download.chapter_ratio();
+    let global_bar = colors.create_subtle_progress_bar(progress_percent / 100.0, 28, ProgressStyle::Blocks);
+    let chapter_bar = colors.create_subtle_progress_bar(chapter_ratio, 28, ProgressStyle::Blocks);
+
+    let images_label = if app.download.images_total > 0 {
+        format!(" {}/{} images", app.download.images_done, app.download.images_total)
+    } else {
+        " en attente…".to_string()
+    };
+
+    let chapter_label = if current_chapter > 0 {
+        format!("Chapitre {}", current_chapter)
+    } else {
+        "Préparation".to_string()
+    };
+    let position_label = if app.download.current_index > 0 {
+        format!("{}/{}", app.download.current_index, total_chapters)
+    } else {
+        format!("0/{}", total_chapters)
+    };
+
+    let mut detail_line = vec![
+        Span::styled(chapter_label, Style::default().fg(colors.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  •  {} ", position_label), Style::default().fg(colors.text_secondary)),
+        Span::styled(format!(" ✅ {}", completed_chapters), Style::default().fg(colors.success)),
+    ];
+    if app.download.failed_chapters > 0 {
+        detail_line.push(Span::styled(
+            format!("  ❌ {}", app.download.failed_chapters),
+            Style::default().fg(colors.error),
+        ));
+    }
+
     let stats_content = vec![
         Line::from(vec![
-            Span::styled("Progress: ", Style::default().fg(colors.text_secondary)),
-            Span::styled(progress_bar, Style::default().fg(colors.get_progress_color(progress_percent / 100.0))),
-            Span::styled(format!(" {:.1}%", progress_percent), Style::default().fg(colors.text_muted)),
+            Span::styled("Global   ", Style::default().fg(colors.text_secondary)),
+            Span::styled(global_bar, Style::default().fg(colors.get_progress_color(progress_percent / 100.0))),
+            Span::styled(format!(" {:>5.1}%", progress_percent), Style::default().fg(colors.text_muted)),
         ]),
         Line::from(vec![
-            Span::styled("Chapitres: ", Style::default().fg(colors.text_secondary)),
-            Span::styled(format!("{}/{}", completed_chapters, total_chapters), Style::default().fg(colors.primary).add_modifier(Modifier::BOLD)),
-            Span::styled(" • ", Style::default().fg(colors.text_muted)),
-            Span::styled("Actuel: ", Style::default().fg(colors.text_secondary)),
-            Span::styled(format!("#{}", current_chapter), Style::default().fg(colors.accent).add_modifier(Modifier::BOLD)),
+            Span::styled("Chapitre ", Style::default().fg(colors.text_secondary)),
+            Span::styled(chapter_bar, Style::default().fg(colors.get_progress_color(chapter_ratio))),
+            Span::styled(images_label, Style::default().fg(colors.text_muted)),
         ]),
+        Line::from(detail_line),
     ];
 
     let progress_widget = Paragraph::new(stats_content)
@@ -781,29 +811,40 @@ fn draw_modern_downloading(f: &mut Frame, app: &mut App, area: Rect, colors: &Wa
     f.render_widget(progress_widget, download_layout[1]);
 
     // 📝 Logs avec coloration intelligente et style amélioré
+    // webtoon-dl préfixe déjà chaque ligne par une icône : on ne la double pas,
+    // on se contente de colorer la ligne selon sa nature.
     let logs_text: Vec<Line> = app.download_logs
         .iter()
         .map(|log| {
-            let (icon, color) = if log.contains("Error") || log.contains("Failed") || log.contains("❌") {
-                ("❌ ", colors.error)
-            } else if log.contains("Complete") || log.contains("Success") || log.contains("✅") {
-                ("✅ ", colors.success)
-            } else if log.contains("Downloading") || log.contains("📥") {
-                ("📥 ", colors.primary)
-            } else if log.contains("Chapter") || log.contains("Chapitre") {
-                ("📄 ", colors.accent)
-            } else if log.contains("Manga") || log.contains("📚") {
-                ("📚 ", colors.primary)
-            } else if log.contains("Found") || log.contains("Detected") {
-                ("🔍 ", colors.text_primary)
+            let color = if log.contains("❌") || log.contains("échec") || log.contains("Error") {
+                colors.error
+            } else if log.contains("⚠️") {
+                colors.accent
+            } else if log.contains("✅") || log.contains("🎉") {
+                colors.success
+            } else if log.contains("📥") {
+                colors.primary
+            } else if log.contains("🔍") {
+                colors.accent
             } else {
-                ("ℹ️ ", colors.text_secondary)
+                colors.text_secondary
             };
-            
-            Line::from(vec![
-                Span::styled(icon, Style::default().fg(color)),
-                Span::styled(log.clone(), Style::default().fg(colors.text_primary)),
-            ])
+
+            let already_has_icon = log
+                .trim_start()
+                .chars()
+                .next()
+                .map(|c| !c.is_ascii())
+                .unwrap_or(false);
+
+            if already_has_icon {
+                Line::from(Span::styled(log.clone(), Style::default().fg(color)))
+            } else {
+                Line::from(vec![
+                    Span::styled("· ", Style::default().fg(colors.text_muted)),
+                    Span::styled(log.clone(), Style::default().fg(color)),
+                ])
+            }
         })
         .collect();
 

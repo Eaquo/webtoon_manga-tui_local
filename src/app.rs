@@ -64,6 +64,7 @@ pub struct App {
     pub selected_chapters_input: String,
     pub input_field: InputField,
     pub download_logs: Vec<String>,
+    pub download: DownloadProgress,
     pub is_downloading: bool,
     pub download_log_receiver: Option<Receiver<String>>,
     pub scroll_offset: u16,
@@ -151,6 +152,7 @@ impl App {
             selected_chapters_input,
             input_field: InputField::None,
             download_logs: Vec::new(),
+            download: DownloadProgress::default(),
             is_downloading: false,
             download_log_receiver: None,
             scroll_offset: 0,
@@ -545,76 +547,18 @@ impl App {
         self.needs_refresh = false;
     }
     
+    /// Progression du téléchargement, alimentée par les événements `@EVT`
+    /// émis par webtoon-dl (voir `DownloadProgress::apply_event`).
     pub fn calculate_download_progress(&self) -> (usize, usize, f32, usize, usize, usize) {
-        let mut total_chapters = 1;
-        let mut completed_chapters = 0;
-        let mut current_chapter_images = 0;
-        let mut total_images_in_current_chapter = 1;
-        let mut current_chapter = 1;
-        let mut last_detected_chapter = 0;
-
-        if !self.selected_chapters_input.is_empty() {
-            let chapters: Vec<&str> = self.selected_chapters_input.split(',').collect();
-            total_chapters = chapters.len().max(1);
-            debug!("Total chapters from input: {}", total_chapters);
-        }
-
-        for log in &self.download_logs {
-            if log.contains("Downloading Chapter") {
-                if let Some(chap_str) = log.split(" of ").next() {
-                    if let Some(num_str) = chap_str.split("Chapter ").last() {
-                        if let Ok(num) = num_str.trim().parse::<usize>() {
-                            current_chapter = num;
-                            if current_chapter != last_detected_chapter {
-                                debug!("New chapter started: {}, resetting image progress", current_chapter);
-                                current_chapter_images = 0;
-                                total_images_in_current_chapter = 1;
-                                last_detected_chapter = current_chapter;
-                            }
-                        }
-                    }
-                }
-            }
-            if log.contains("Found") && log.contains("images for Chapter") {
-                if let Some(num_str) = log.split("Found ").nth(1) {
-                    if let Some(num) = num_str.split(" images").next() {
-                        if let Ok(num) = num.trim().parse::<usize>() {
-                            total_images_in_current_chapter = num.max(1);
-                            debug!("Total images in current chapter: {}", total_images_in_current_chapter);
-                        }
-                    }
-                }
-            }
-            if log.contains("Downloaded image") {
-                if let Some(img_str) = log.split("Downloaded image ").nth(1) {
-                    if let Some(num_str) = img_str.split('/').next() {
-                        if let Ok(num) = num_str.trim().parse::<usize>() {
-                            current_chapter_images = num;
-                            debug!("Images downloaded in current chapter: {}/{}", current_chapter_images, total_images_in_current_chapter);
-                        }
-                    }
-                }
-            }
-            if log.contains(".cbr created with") {
-                completed_chapters += 1;
-                current_chapter_images = total_images_in_current_chapter;
-                debug!("Detected completed chapter, total completed: {}", completed_chapters);
-            }
-        }
-
-        let progress = if total_chapters > 0 {
-            let chapter_progress = completed_chapters as f32 / total_chapters as f32;
-            let image_progress = if completed_chapters < current_chapter {
-                (current_chapter_images as f32 / total_images_in_current_chapter as f32) / total_chapters as f32
-            } else {
-                0.0
-            };
-            ((chapter_progress + image_progress) * 100.0).min(100.0).max(0.0)
-        } else {
-            0.0
-        };
-
-        (total_chapters, completed_chapters, progress, current_chapter_images, total_images_in_current_chapter, current_chapter)
+        let d = &self.download;
+        (
+            d.total_chapters.max(1),
+            d.done_chapters,
+            d.global_percent(),
+            d.images_done,
+            d.images_total.max(1),
+            d.current_chapter,
+        )
     }
 
     pub fn launch_webtoon_downloader(&mut self) -> Result<()> {
@@ -643,6 +587,7 @@ impl App {
         let (tx, rx) = bounded(100);
         self.download_log_receiver = Some(rx);
         self.download_logs.clear();
+        self.download = DownloadProgress::default();
         self.is_downloading = true;
         self.download_finished = false;
         self.has_user_scrolled = false;
@@ -656,6 +601,7 @@ impl App {
             let result = Command::new("webtoon-dl")
                 .arg(&url)
                 .arg(&chapters)
+                .arg("--tui")
                 .arg("--output-dir")
                 .arg(&output_dir_clone)
                 .stdout(Stdio::piped())
@@ -720,23 +666,31 @@ impl App {
         if self.is_downloading {
             let should_clear_receiver = false;
             if let Some(receiver) = &self.download_log_receiver {
+                let mut pending: Vec<String> = Vec::new();
                 while let Ok(log) = receiver.try_recv() {
-                    let clean_log = strip_ansi_escapes(&log);
-                    if clean_log.contains("📖 Manga en cours de téléchargement:") {
-                        if let Some(name) = clean_log.split("📖 Manga en cours de téléchargement: ").nth(1) {
-                            self.current_download_manga_name = name.trim().to_string();
-                            debug!("Updated current_download_manga_name to: {}", self.current_download_manga_name);
+                    pending.push(strip_ansi_escapes(&log));
+                }
+
+                for clean_log in pending {
+                    // Les lignes @EVT pilotent la progression et ne sont pas affichées.
+                    if let Some(event) = DownloadEvent::parse(&clean_log) {
+                        if let DownloadEvent::Manga { ref name, .. } = event {
+                            self.current_download_manga_name = name.clone();
                         }
+                        let finished = matches!(event, DownloadEvent::Done { .. });
+                        self.download.apply_event(event);
+                        if finished {
+                            self.status = format!(
+                                "{} terminé — {}",
+                                self.current_download_manga_name, self.download.summary()
+                            );
+                            self.download_finished = true;
+                            let tx = self.create_refresh_trigger_after(Duration::from_secs(3));
+                            self.refresh_trigger = Some(tx);
+                        }
+                        continue;
                     }
-                    if clean_log.contains("Download Complete!") {
-                        self.status = format!(
-                            "Download {} terminé. Attendez quelques secondes avant de rafraîchir (r).",
-                            self.current_download_manga_name
-                        );
-                        self.download_finished = false;
-                        let tx = self.create_refresh_trigger_after(Duration::from_secs(3));
-                        self.refresh_trigger = Some(tx);
-                    }
+
                     self.download_logs.push(clean_log);
                     if self.download_logs.len() > 200 {
                         self.download_logs.drain(0..self.download_logs.len() - 200);
@@ -1572,4 +1526,260 @@ impl App {
 
 fn strip_ansi_escapes(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Protocole de progression avec webtoon-dl
+//
+// webtoon-dl --tui émet, en plus de ses lignes lisibles, une ligne structurée
+// par événement :
+//     @EVT|<type>|clé=valeur|clé=valeur
+// Ces lignes sont consommées ici et ne s'affichent jamais dans le panneau de
+// logs, ce qui garde celui-ci lisible et la progression exacte.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub enum DownloadEvent {
+    Plan { total: usize },
+    Manga { name: String, total: usize },
+    Folder { path: String },
+    ChapterStart { num: usize, idx: usize, total: usize },
+    Images { count: usize },
+    Image { i: usize, n: usize },
+    ChapterDone { num: usize },
+    ChapterFailed { num: usize, reason: String },
+    Done { ok: usize, failed: usize },
+}
+
+impl DownloadEvent {
+    pub fn parse(line: &str) -> Option<Self> {
+        let rest = line.trim().strip_prefix("@EVT|")?;
+        let mut parts = rest.split('|');
+        let kind = parts.next()?;
+
+        let mut fields: HashMap<&str, &str> = HashMap::new();
+        for part in parts {
+            if let Some((k, v)) = part.split_once('=') {
+                fields.insert(k, v);
+            }
+        }
+        let num = |k: &str| -> usize { fields.get(k).and_then(|v| v.parse().ok()).unwrap_or(0) };
+        let text = |k: &str| -> String { fields.get(k).map(|v| v.to_string()).unwrap_or_default() };
+
+        Some(match kind {
+            "plan" => DownloadEvent::Plan { total: num("total") },
+            "manga" => DownloadEvent::Manga { name: text("name"), total: num("total") },
+            "folder" => DownloadEvent::Folder { path: text("path") },
+            "chapter_start" => DownloadEvent::ChapterStart {
+                num: num("num"),
+                idx: num("idx"),
+                total: num("total"),
+            },
+            "images" => DownloadEvent::Images { count: num("count") },
+            "image" => DownloadEvent::Image { i: num("i"), n: num("n") },
+            "chapter_done" => DownloadEvent::ChapterDone { num: num("num") },
+            "chapter_failed" => DownloadEvent::ChapterFailed {
+                num: num("num"),
+                reason: text("reason"),
+            },
+            "done" => DownloadEvent::Done { ok: num("ok"), failed: num("failed") },
+            _ => return None,
+        })
+    }
+}
+
+/// État de progression du téléchargement en cours.
+///
+/// Mis à jour au fil de l'eau : contrairement à l'ancienne approche qui
+/// re-analysait tout l'historique des logs à chaque frame, les compteurs
+/// restent justes même quand les vieux logs sont purgés.
+#[derive(Debug, Clone, Default)]
+pub struct DownloadProgress {
+    pub total_chapters: usize,
+    pub done_chapters: usize,
+    pub failed_chapters: usize,
+    pub current_chapter: usize,
+    pub current_index: usize,
+    pub images_done: usize,
+    pub images_total: usize,
+    pub folder: String,
+    pub finished: bool,
+    /// Vrai quand le chapitre courant est déjà comptabilisé (terminé ou en
+    /// échec). Évite de l'additionner une seconde fois via `chapter_ratio`.
+    current_settled: bool,
+}
+
+impl DownloadProgress {
+    pub fn apply_event(&mut self, event: DownloadEvent) {
+        match event {
+            DownloadEvent::Plan { total } | DownloadEvent::Manga { total, .. } => {
+                if total > 0 {
+                    self.total_chapters = total;
+                }
+            }
+            DownloadEvent::Folder { path } => self.folder = path,
+            DownloadEvent::ChapterStart { num, idx, total } => {
+                self.current_chapter = num;
+                self.current_index = idx;
+                if total > 0 {
+                    self.total_chapters = total;
+                }
+                // Nouveau chapitre : on repart de zéro pour la barre d'images.
+                self.images_done = 0;
+                self.images_total = 0;
+                self.current_settled = false;
+            }
+            DownloadEvent::Images { count } => self.images_total = count,
+            DownloadEvent::Image { i, n } => {
+                self.images_done = i;
+                if n > 0 {
+                    self.images_total = n;
+                }
+            }
+            DownloadEvent::ChapterDone { .. } => {
+                self.done_chapters += 1;
+                // La barre du chapitre reste pleine à l'écran, mais le chapitre
+                // est désormais compté dans `done_chapters`.
+                self.images_done = self.images_total;
+                self.current_settled = true;
+            }
+            DownloadEvent::ChapterFailed { .. } => {
+                self.failed_chapters += 1;
+                self.current_settled = true;
+            }
+            DownloadEvent::Done { ok, failed } => {
+                self.done_chapters = ok;
+                self.failed_chapters = failed;
+                self.finished = true;
+            }
+        }
+    }
+
+    /// Avancement dans le chapitre courant, entre 0.0 et 1.0.
+    pub fn chapter_ratio(&self) -> f32 {
+        if self.images_total == 0 {
+            return 0.0;
+        }
+        (self.images_done as f32 / self.images_total as f32).clamp(0.0, 1.0)
+    }
+
+    /// Avancement global en pourcentage : chapitres terminés + fraction du
+    /// chapitre en cours, pour que la barre bouge pendant un long chapitre.
+    pub fn global_percent(&self) -> f32 {
+        if self.finished {
+            return 100.0;
+        }
+        let total = self.total_chapters.max(1) as f32;
+        let settled = (self.done_chapters + self.failed_chapters) as f32;
+        let in_flight = if self.current_settled { 0.0 } else { self.chapter_ratio() };
+        (((settled + in_flight) / total) * 100.0).clamp(0.0, 100.0)
+    }
+
+    pub fn summary(&self) -> String {
+        if self.failed_chapters > 0 {
+            format!("{} ok, {} en échec", self.done_chapters, self.failed_chapters)
+        } else {
+            format!("{} chapitre(s) téléchargé(s)", self.done_chapters)
+        }
+    }
+}
+
+#[cfg(test)]
+mod download_progress_tests {
+    use super::*;
+
+    fn feed(p: &mut DownloadProgress, lines: &[&str]) {
+        for l in lines {
+            if let Some(e) = DownloadEvent::parse(l) {
+                p.apply_event(e);
+            }
+        }
+    }
+
+    #[test]
+    fn les_lignes_humaines_ne_sont_pas_des_evenements() {
+        assert!(DownloadEvent::parse("📖 Manga : Kagurabachi").is_none());
+        assert!(DownloadEvent::parse("").is_none());
+        assert!(DownloadEvent::parse("@EVT|inconnu|a=1").is_none());
+    }
+
+    #[test]
+    fn une_plage_de_chapitres_donne_le_bon_total() {
+        // Cas de la capture : "100-150" doit donner 51, pas 1.
+        let mut p = DownloadProgress::default();
+        feed(&mut p, &["@EVT|plan|total=51|first=100|last=150"]);
+        assert_eq!(p.total_chapters, 51);
+    }
+
+    #[test]
+    fn un_chapitre_termine_nest_compte_quune_fois() {
+        let mut p = DownloadProgress::default();
+        feed(&mut p, &[
+            "@EVT|plan|total=51",
+            "@EVT|chapter_start|num=100|idx=1|total=51",
+            "@EVT|images|num=100|count=18",
+            "@EVT|chapter_done|num=100|images=18",
+        ]);
+        assert_eq!(p.done_chapters, 1);
+        assert_eq!(p.total_chapters, 51);
+        assert!(p.global_percent() < 3.0, "1/51 ≈ 2%, obtenu {}", p.global_percent());
+    }
+
+    #[test]
+    fn la_barre_du_chapitre_avance_avec_les_images() {
+        let mut p = DownloadProgress::default();
+        feed(&mut p, &[
+            "@EVT|plan|total=2",
+            "@EVT|chapter_start|num=1|idx=1|total=2",
+            "@EVT|images|num=1|count=10",
+            "@EVT|image|num=1|i=5|n=10",
+        ]);
+        assert_eq!(p.chapter_ratio(), 0.5);
+        assert_eq!(p.global_percent(), 25.0); // (0 + 0.5) / 2
+    }
+
+    #[test]
+    fn un_nouveau_chapitre_remet_la_barre_images_a_zero() {
+        let mut p = DownloadProgress::default();
+        feed(&mut p, &[
+            "@EVT|plan|total=2",
+            "@EVT|chapter_start|num=1|idx=1|total=2",
+            "@EVT|images|num=1|count=10",
+            "@EVT|image|num=1|i=10|n=10",
+            "@EVT|chapter_done|num=1",
+            "@EVT|chapter_start|num=2|idx=2|total=2",
+        ]);
+        assert_eq!(p.images_done, 0);
+        assert_eq!(p.chapter_ratio(), 0.0);
+        assert_eq!(p.current_chapter, 2);
+        assert_eq!(p.current_index, 2);
+    }
+
+    #[test]
+    fn les_echecs_font_avancer_la_progression() {
+        let mut p = DownloadProgress::default();
+        feed(&mut p, &[
+            "@EVT|plan|total=2",
+            "@EVT|chapter_start|num=1|idx=1|total=2",
+            "@EVT|chapter_failed|num=1|reason=page inaccessible",
+        ]);
+        assert_eq!(p.failed_chapters, 1);
+        assert_eq!(p.global_percent(), 50.0);
+    }
+
+    #[test]
+    fn la_progression_ne_depasse_jamais_cent() {
+        let mut p = DownloadProgress::default();
+        feed(&mut p, &[
+            "@EVT|plan|total=1",
+            "@EVT|chapter_start|num=1|idx=1|total=1",
+            "@EVT|images|num=1|count=5",
+            "@EVT|image|num=1|i=5|n=5",
+            "@EVT|chapter_done|num=1",
+            "@EVT|done|ok=1|failed=0",
+        ]);
+        assert!(p.finished);
+        assert_eq!(p.global_percent(), 100.0);
+        assert_eq!(p.summary(), "1 chapitre(s) téléchargé(s)");
+    }
 }
