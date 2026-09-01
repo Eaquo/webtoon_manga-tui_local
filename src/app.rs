@@ -93,10 +93,24 @@ impl App {
         debug!("Creating new app with manga_dir: {:?}", manga_dir);
         
         let mut config = Config::load()?;
-        config.settings.enable_image_rendering = true;
 
-        let mut image_picker = Picker::from_termios()
-            .map_err(|e| anyhow::anyhow!("Failed to initialize Picker: {}", e))?;
+        // Certains terminaux ne rapportent pas leur taille en pixels : le
+        // Picker échoue alors avec « font_size zero value ». Ce n'était une
+        // raison de refuser de démarrer que parce que l'erreur remontait
+        // jusqu'à main() — alors que l'affichage des images est optionnel.
+        // On se rabat sur une taille de police classique, et si même cela
+        // échoue on tourne sans couvertures.
+        let mut image_picker = match Picker::from_termios() {
+            Ok(picker) => {
+                config.settings.enable_image_rendering = true;
+                picker
+            }
+            Err(e) => {
+                debug!("Picker indisponible ({e}) : rendu d'images désactivé");
+                config.settings.enable_image_rendering = false;
+                Picker::new((8, 16))
+            }
+        };
         image_picker.guess_protocol();
 
         let download_url = config.last_download_url.clone().unwrap_or_default();

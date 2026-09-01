@@ -42,11 +42,18 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialiser le logger
+    // Le log allait dans le répertoire courant : un manga_reader.log se créait
+    // partout où la commande était lancée. Il vit désormais à un seul endroit.
+    let log_path = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .map(|d| d.join("manga_reader"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let _ = std::fs::create_dir_all(&log_path);
     let log_file = OpenOptions::new()
         .write(true)
         .append(true)
         .create(true)
-        .open("manga_reader.log")
+        .open(log_path.join("manga_reader.log"))
         .context("Failed to open log file")?;
 
     Builder::new()
@@ -78,18 +85,39 @@ fn main() -> Result<()> {
     run(manga_dir)
 }
 
-fn run(manga_dir: PathBuf) -> Result<()> {
-    // Configurer le terminal
-    enable_raw_mode().context("Échec de l'activation du mode brut")?;
-    io::stdout()
-        .execute(EnterAlternateScreen)
-        .context("Échec de l'entrée dans l'écran alternatif")?;
+/// Restaure le terminal quoi qu'il arrive.
+///
+/// Avant, la moindre erreur survenant après `enable_raw_mode()` laissait le
+/// shell en mode brut, écran alternatif actif et suivi souris allumé — d'où
+/// les `^[[<35;36;33M` qui défilaient à l'écran. `Drop` étant aussi exécuté
+/// lors d'un `panic!`, la restauration est désormais garantie.
+struct TerminalGuard;
 
-    // Activer la capture de la souris
-    io::stdout()
-        .execute(crossterm::event::EnableMouseCapture)
-        .context("Échec de l'activation de la capture de la souris")?;
-    debug!("Capture de la souris activée");
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode().context("Échec de l'activation du mode brut")?;
+        io::stdout()
+            .execute(EnterAlternateScreen)
+            .context("Échec de l'entrée dans l'écran alternatif")?;
+        io::stdout()
+            .execute(crossterm::event::EnableMouseCapture)
+            .context("Échec de l'activation de la capture de la souris")?;
+        debug!("Terminal configuré (mode brut, écran alternatif, souris)");
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = io::stdout().execute(crossterm::event::DisableMouseCapture);
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        debug!("Terminal restauré");
+    }
+}
+
+fn run(manga_dir: PathBuf) -> Result<()> {
+    let _terminal_guard = TerminalGuard::new()?;
 
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("Échec de la création du terminal")?;
@@ -136,10 +164,23 @@ fn run(manga_dir: PathBuf) -> Result<()> {
         } else {
             manga_dir
         };
+
+    // Contrôle placé après la résolution via la config : la bibliothèque peut
+    // avoir été déplacée. On le dit clairement plutôt que de laisser remonter
+    // un « No such file or directory (os error 2) » quelques appels plus loin.
+    if !manga_dir.exists() {
+        anyhow::bail!(
+            "Dossier de mangas introuvable : {}\n\
+             Vérifiez « last_manga_dir » dans ~/.config/manga_reader/config.json, \
+             ou lancez : manga-reader --manga-dir <chemin>",
+            manga_dir.display()
+        );
+    }
     
-    // Ouvrir la base et lancer le scan complet
-let conn = manga_indexer::open_db()?;
-manga_indexer::scan_and_index(&conn, &manga_dir)?;
+    // Pas de scan complet ici : App::new() appelle refresh_manga_list(), qui
+    // compare les dates de modification à `last_scan_time` et ne réindexe que
+    // si quelque chose a bougé. Le scan inconditionnel qui se trouvait ici
+    // rendait ce mécanisme inutile et bloquait le démarrage plusieurs secondes.
     // Créer l'état de l'application
     let mut app = App::new(manga_dir, theme)?;
 
@@ -183,16 +224,6 @@ manga_indexer::scan_and_index(&conn, &manga_dir)?;
         }
     }
 
-    // Restaurer le terminal
-    io::stdout()
-        .execute(crossterm::event::DisableMouseCapture)
-        .context("Échec de la désactivation de la capture de la souris")?;
-    debug!("Capture de la souris désactivée");
-
-    disable_raw_mode().context("Échec de la désactivation du mode brut")?;
-    io::stdout()
-        .execute(LeaveAlternateScreen)
-        .context("Échec de la sortie de l'écran alternatif")?;
-
+    // La restauration du terminal est assurée par TerminalGuard::drop.
     Ok(())
 }
