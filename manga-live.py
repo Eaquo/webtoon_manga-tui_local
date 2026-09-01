@@ -1083,6 +1083,63 @@ class ModernButton:
         text_rect = text_surf.get_rect(center=self.rect.center)
         surface.blit(text_surf, text_rect)
 
+class QuitButton:
+    """Bouton de sortie, dimensionné pour le doigt.
+
+    Le lecteur tourne en plein écran sans décoration : sans ce bouton, quitter
+    impose un clavier. Les autres boutons font 30 px de haut, ce qui représente
+    environ 3 mm sur un écran dense (Surface Book 2) et n'est pas atteignable
+    au doigt. La taille est donc calculée à partir de celle de l'écran, avec un
+    plancher confortable.
+    """
+
+    MARGIN = 20
+
+    def __init__(self, screen_width, screen_height, font, colors):
+        self.colors = colors
+        self.font = font
+        self.is_hovered = False
+        self.rect = pygame.Rect(0, 0, 0, 0)
+        self.reposition(screen_width, screen_height)
+
+    @staticmethod
+    def size_for(screen_width, screen_height):
+        """Environ 10 mm de côté quelle que soit la densité de l'écran."""
+        width = max(110, int(screen_width * 0.075))
+        height = max(44, int(screen_height * 0.05))
+        return width, height
+
+    def reposition(self, screen_width, screen_height, left_obstacle=0):
+        """Place le bouton en bas à gauche.
+
+        `left_obstacle` est la largeur occupée par la barre de vignettes quand
+        elle est déployée : elle couvre tout le bord gauche, donc le bouton se
+        décale à sa droite plutôt que de se retrouver dessous.
+        """
+        width, height = self.size_for(screen_width, screen_height)
+        left = self.MARGIN + left_obstacle
+        self.rect = pygame.Rect(left, screen_height - height - self.MARGIN, width, height)
+
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEMOTION:
+            self.is_hovered = self.rect.collidepoint(event.pos)
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            # Un tap tactile arrive ici comme un clic gauche : Hyprland
+            # convertit le tactile en événements pointeur.
+            if event.button == 1 and self.rect.collidepoint(event.pos):
+                return True
+        return False
+
+    def draw(self, surface):
+        base = safe_color(self.colors["button_bg"])
+        # Teinte rougie pour distinguer la sortie des autres commandes.
+        tint = (min(255, base[0] + 90), max(0, base[1] - 15), max(0, base[2] - 15))
+        color = tuple(min(255, c + 35) for c in tint) if self.is_hovered else tint
+        draw_rounded_rect(surface, color, self.rect, radius=12)
+        label = self.font.render("✕  Quitter", True, safe_color(self.colors["foreground"]))
+        surface.blit(label, label.get_rect(center=self.rect.center))
+
+
 class Slider:
     def __init__(self, x, y, width, height, min_value, max_value, initial_value, colors):
         self.rect = pygame.Rect(x, y, width, height)
@@ -2371,6 +2428,7 @@ def run_reader(archive_path, start_page=1, cache_dir=None, initial_opacity=0):
         t0 = print_timing("Initialisation de la progression et du mode", t0)
 
         font = pygame.font.SysFont('arial', 18, bold=True)
+        quit_button = QuitButton(screen_width, screen_height, font, colors)
         mode_button = ModernButton(screen_width - 250, 10, 120, 30, f"{mode.capitalize()}", font, colors)
         play_button = ModernButton(screen_width - 120, 10, 100, 30, "Play", font, colors)
         default_scroll_speed = config_menu.config["webtoon_scroll_speed"]
@@ -2423,6 +2481,15 @@ def run_reader(archive_path, start_page=1, cache_dir=None, initial_opacity=0):
             last_scroll_time = current_time
 
             t_loop_start = time.perf_counter()
+
+            # Recalculé à chaque image : la barre de vignettes s'ouvre et se
+            # ferme en cours de route, et la fenêtre peut être redimensionnée.
+            quit_button.reposition(
+                screen_width,
+                screen_height,
+                left_obstacle=thumbnail_viewer.rect.width if thumbnail_viewer.visible else 0,
+            )
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -2663,6 +2730,14 @@ def run_reader(archive_path, start_page=1, cache_dir=None, initial_opacity=0):
                         elif mode == 'manga':
                             if event.y > 0: manga_renderer.prev_page()
                             elif event.y < 0: manga_renderer.next_page()
+                # Au niveau supérieur de la boucle : la branche MOUSEWHEEL
+                # plus haut ne voit pas les clics. Placé avant la barre de
+                # vignettes, qui consomme ceux de sa zone.
+                if quit_button.handle_event(event):
+                    logging.debug("Sortie demandée via le bouton Quitter")
+                    running = False
+                    continue
+
                 if mode_button.handle_event(event):
                     if mode == 'webtoon':
                         mode = 'manga'
@@ -2756,6 +2831,7 @@ def run_reader(archive_path, start_page=1, cache_dir=None, initial_opacity=0):
 
             text = font.render(f"{Path(archive_path).stem}", True, colors["foreground"])
             screen.blit(text, (10, 10))
+            quit_button.draw(screen)
             mode_button.draw(screen)
             if mode == 'webtoon':
                 play_button.draw(screen)
