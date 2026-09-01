@@ -418,19 +418,17 @@ def show_splash(image_path=None, wait_time=1.2, bg_color=("button_bg"), logo_txt
     fg_color = colors["foreground"]
     manga_color = colors["slider_handle"]
     chalk_color = colors["button_hover"]
-    
+
     splash = pygame.display.set_mode((sw, sh), pygame.NOFRAME)
     pygame.display.set_caption("Manga Live - Chargement...")
-    
-    # Variables d'animation
+
     splash_start = time.time()
     logo_alpha = 0
     logo_scale = 0.3
     text_alpha = 0
     progress = 0.0
     particles = []
-    
-    # Initialiser les particules
+
     for i in range(3):
         particles.append({
             'x': sw // 2 + ((-1) ** i) * (60 + i * 20),
@@ -441,14 +439,12 @@ def show_splash(image_path=None, wait_time=1.2, bg_color=("button_bg"), logo_txt
             'speed': 0.2 + (i * 0.08),
             'phase': i * 0.5
         })
-    
-    # Preload asynchrone avec progression
+
     preload_done = threading.Event()
     preload_progress = {'value': 0.0}
-    
+
     def preload_wrapper():
         if preload_func:
-            # Simuler progression pendant le preload
             steps = 15
             for step in range(steps):
                 preload_progress['value'] = step / steps
@@ -456,7 +452,7 @@ def show_splash(image_path=None, wait_time=1.2, bg_color=("button_bg"), logo_txt
             preload_func()
         preload_progress['value'] = 1.0
         preload_done.set()
-    
+
     if preload_func:
         th = threading.Thread(target=preload_wrapper)
         th.daemon = True
@@ -464,19 +460,47 @@ def show_splash(image_path=None, wait_time=1.2, bg_color=("button_bg"), logo_txt
     else:
         preload_done.set()
         preload_progress['value'] = 1.0
-    
-    # Boucle d'animation principale
+
+    # === FONTS CACHÉES (une seule fois) ===
+    _font_cache = {}
+    def get_font(name, size, bold=False):
+        key = (name, size, bold)
+        if key not in _font_cache:
+            _font_cache[key] = pygame.font.SysFont(name, size, bold=bold)
+        return _font_cache[key]
+
+    # Font fixe pré-créée immédiatement
+    percent_font = get_font("arial", 16, bold=True)
+
+    # === IMAGE DE FOND CHARGÉE UNE SEULE FOIS ===
+    bg_surf = None
+    if image_path and Path(image_path).exists():
+        try:
+            with Image.open(image_path) as im:
+                im = im.convert("RGB")
+                im = im.filter(ImageFilter.GaussianBlur(6))
+                im.thumbnail((sw + 20, sh + 20))
+                arr = pygame.image.fromstring(im.tobytes(), im.size, "RGB")
+                bg_surf = pygame.transform.scale(arr, (sw + 20, sh + 20))
+        except Exception:
+            pass
+
+    # === MASQUE COINS ARRONDIS PRÉ-CALCULÉ ===
+    rounded_mask = None
+    if do_radius:
+        rounded_mask = pygame.Surface((sw, sh), pygame.SRCALPHA)
+        pygame.draw.rect(rounded_mask, (0, 0, 0, 0), (0, 0, sw, sh))
+        pygame.draw.rect(rounded_mask, fg_color, (0, 0, sw, sh), border_radius=5)
+
     while True:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
-        
+
         now = time.time()
         elapsed = now - splash_start
-        
-        # === CALCUL DES ANIMATIONS ===
-        # Logo apparition (0-0.6s)
+
         if elapsed < 0.6:
             anim_progress = elapsed / 0.6
             logo_alpha = int(255 * min(1.0, anim_progress * 1.5))
@@ -484,196 +508,118 @@ def show_splash(image_path=None, wait_time=1.2, bg_color=("button_bg"), logo_txt
         else:
             logo_alpha = 255
             logo_scale = 1.0
-        
-        # Texte de chargement apparition (0.4-1.0s)
+
         if elapsed > 0.4:
-            text_progress = min(1.0, (elapsed - 0.4) / 0.6)
-            text_alpha = int(255 * text_progress)
-        
-        # Progression globale
+            text_alpha = int(255 * min(1.0, (elapsed - 0.4) / 0.6))
+
         progress = min(1.0, preload_progress['value'])
-        
-        # Particules animation
+
         for particle in particles:
             if elapsed > 0.2:
                 particle['alpha'] = min(particle['target_alpha'], particle['alpha'] + 1.5)
                 particle['phase'] += particle['speed']
-        
-        # === RENDU ===
+
         splash.fill(bg_color)
-        
-        # Coins arrondis
-        if do_radius:
-            radius = 5
-            mask = pygame.Surface((sw, sh), pygame.SRCALPHA)
-            pygame.draw.rect(mask, (0,0,0,0), (0,0,sw,sh))
-            pygame.draw.rect(mask, fg_color, (0,0,sw,sh), border_radius=radius)
-            splash.blit(mask, (0,0), special_flags=pygame.BLEND_RGBA_MIN)
-        
-        # Image de fond avec parallax subtil
-        bg_surf = None
-        if image_path and Path(image_path).exists():
-            try:
-                with Image.open(image_path) as im:
-                    im = im.convert("RGB")
-                    im = im.filter(ImageFilter.GaussianBlur(6))
-                    im.thumbnail((sw + 20, sh + 20))
-                    arr = pygame.image.fromstring(im.tobytes(), im.size, "RGB")
-                    bg_surf = pygame.transform.scale(arr, (sw + 20, sh + 20))
-            except Exception:
-                pass
-        
+
+        if rounded_mask:
+            splash.blit(rounded_mask, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+
         if bg_surf:
-            # Effet parallax léger
             offset_x = int(math.sin(elapsed * 0.3) * 3)
             offset_y = int(math.cos(elapsed * 0.2) * 2)
             splash.blit(bg_surf, (-10 + offset_x, -10 + offset_y))
-            
-            # Overlay sombre animé
             overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
             overlay_alpha = int(120 + 20 * math.sin(elapsed * 0.5))
             overlay.fill((0, 0, 0, overlay_alpha))
             splash.blit(overlay, (0, 0))
-        
-        # Particules flottantes
+
         for particle in particles:
             if particle['alpha'] > 0:
                 x = particle['x'] + math.sin(particle['phase']) * 4
                 y = particle['y'] + math.cos(particle['phase'] * 0.8) * 3
-                
-                # Créer une surface pour la particule avec glow
                 particle_surf = pygame.Surface((particle['size'] * 6, particle['size'] * 6), pygame.SRCALPHA)
-                
-                # Effet glow
                 for r in range(particle['size'] * 3, 0, -1):
                     alpha = particle['alpha'] // (r + 1)
-                    color = (*manga_color, alpha)
-                    pygame.draw.circle(particle_surf, color, 
-                                     (particle['size'] * 3, particle['size'] * 3), r)
-                
+                    pygame.draw.circle(particle_surf, (*manga_color, alpha),
+                                       (particle['size'] * 3, particle['size'] * 3), r)
                 splash.blit(particle_surf, (x - particle['size'] * 3, y - particle['size'] * 3))
-        
-        # Logo avec effet de bounce et glow
+
         if logo_alpha > 0:
-            font_size = int(54 * logo_scale)
-            font = pygame.font.SysFont("comicsansms", font_size, bold=True)
-            
-            # Effet glow sur le logo
+            font_size = max(1, int(54 * logo_scale))
+            font = get_font("comicsansms", font_size, bold=True)
             glow_layers = 5
             for layer in range(glow_layers, 0, -1):
                 glow_alpha = (logo_alpha // glow_layers) // layer
-                glow_size = font_size + layer * 2
-                glow_font = pygame.font.SysFont("comicsansms", glow_size, bold=True)
+                glow_size = max(1, font_size + layer * 2)
+                glow_font = get_font("comicsansms", glow_size, bold=True)
                 glow_text = glow_font.render(logo_txt, True, manga_color)
                 glow_text.set_alpha(glow_alpha)
-                glow_rect = glow_text.get_rect(center=(sw // 2, sh // 2 - 40))
-                splash.blit(glow_text, glow_rect)
-            
-            # Texte principal du logo
+                splash.blit(glow_text, glow_text.get_rect(center=(sw // 2, sh // 2 - 40)))
+
             main_text = font.render(logo_txt, True, fg_color)
             main_text.set_alpha(logo_alpha)
-            
-            # Petit effet de tremblement sur le logo
             shake_x = int(math.sin(elapsed * 8) * (1 - logo_scale) * 2)
             shake_y = int(math.cos(elapsed * 12) * (1 - logo_scale) * 1)
-            
-            main_rect = main_text.get_rect(center=(sw // 2 + shake_x, sh // 2 - 40 + shake_y))
-            splash.blit(main_text, main_rect)
-        
-        # Ligne décorative animée
+            splash.blit(main_text, main_text.get_rect(center=(sw // 2 + shake_x, sh // 2 - 40 + shake_y)))
+
         if logo_alpha > 100:
             line_width = int(120 * (logo_alpha / 255))
             line_y = sh // 2 - 5
-            
-            # Ligne avec gradient
             for i in range(line_width):
                 ratio = abs(i - line_width // 2) / (line_width // 2)
                 alpha = int(255 * (1 - ratio) * (logo_alpha / 255))
-                color = (*manga_color, alpha)
-                
                 line_surf = pygame.Surface((2, 3), pygame.SRCALPHA)
-                line_surf.fill(color)
+                line_surf.fill((*manga_color, alpha))
                 splash.blit(line_surf, (sw // 2 - line_width // 2 + i, line_y))
-        
-        # Texte de chargement avec pulsation
+
         if text_alpha > 0:
             pulse = 0.8 + 0.2 * math.sin(elapsed * 3)
-            font2_size = int(28 * pulse)
-            font2 = pygame.font.SysFont("arial", font2_size, bold=False)
-            
-            loading_text = "Chargement du Webtoon"
-            # Animation des points
+            font2_size = max(1, int(28 * pulse))
+            font2 = get_font("arial", font2_size)
             dots = "." * (int(elapsed * 2) % 4)
-            full_text = loading_text + dots
-            
-            t2 = font2.render(full_text, True, chalk_color)
+            t2 = font2.render(f"Chargement du Webtoon{dots}", True, chalk_color)
             t2.set_alpha(text_alpha)
-            r2 = t2.get_rect(center=(sw // 2, sh // 2 + 45))
-            splash.blit(t2, r2)
-        
-        # Barre de progression stylée
+            splash.blit(t2, t2.get_rect(center=(sw // 2, sh // 2 + 45)))
+
         if text_alpha > 50 and progress > 0:
             progress_width = 200
             progress_height = 6
             progress_x = sw // 2 - progress_width // 2
             progress_y = sh // 2 + 85
-            
-            # Fond de la barre avec glow
+
             bg_glow = pygame.Surface((progress_width + 10, progress_height + 6), pygame.SRCALPHA)
             pygame.draw.rect(bg_glow, (*chalk_color, 30), (0, 0, progress_width + 10, progress_height + 6), border_radius=4)
             splash.blit(bg_glow, (progress_x - 5, progress_y - 3))
-            
-            # Fond de la barre
             pygame.draw.rect(splash, (40, 40, 50), (progress_x, progress_y, progress_width, progress_height), border_radius=3)
-            
-            # Barre de progression avec animation fluide
+
             current_width = int(progress_width * progress)
             if current_width > 0:
-                # Gradient sur la barre
                 for i in range(current_width):
                     ratio = i / progress_width
-                    r = int(manga_color[0] * (1 + ratio * 0.3))
-                    g = int(manga_color[1] * (1 + ratio * 0.2))
-                    b = int(manga_color[2] * (1 + ratio * 0.4))
-                    color = (min(255, r), min(255, g), min(255, b))
-                    
-                    pygame.draw.line(splash, color, 
-                                   (progress_x + i, progress_y + 1), 
-                                   (progress_x + i, progress_y + progress_height - 1))
-                
-                # Effet de lueur qui se déplace
+                    r = min(255, int(manga_color[0] * (1 + ratio * 0.3)))
+                    g = min(255, int(manga_color[1] * (1 + ratio * 0.2)))
+                    b = min(255, int(manga_color[2] * (1 + ratio * 0.4)))
+                    pygame.draw.line(splash, (r, g, b),
+                                     (progress_x + i, progress_y + 1),
+                                     (progress_x + i, progress_y + progress_height - 1))
                 glow_pos = current_width - 15
                 if glow_pos > 0:
                     glow_surf = pygame.Surface((30, progress_height + 4), pygame.SRCALPHA)
                     for x in range(30):
                         alpha = int(100 * math.exp(-(x - 15) ** 2 / 50))
-                        glow_color = (*manga_color, alpha)
-                        pygame.draw.line(glow_surf, glow_color, (x, 0), (x, progress_height + 4))
-                    
+                        pygame.draw.line(glow_surf, (*manga_color, alpha), (x, 0), (x, progress_height + 4))
                     splash.blit(glow_surf, (progress_x + glow_pos - 15, progress_y - 2))
-            
-            # Pourcentage avec effet typewriter
-            percent = int(progress * 100)
-            percent_text = f"{percent}%"
-            percent_font = pygame.font.SysFont("arial", 16, bold=True)
-            percent_surf = percent_font.render(percent_text, True, chalk_color)
+
+            percent_surf = percent_font.render(f"{int(progress * 100)}%", True, chalk_color)
             percent_surf.set_alpha(text_alpha)
-            percent_rect = percent_surf.get_rect(center=(sw // 2, progress_y + 20))
-            splash.blit(percent_surf, percent_rect)
-        
+            splash.blit(percent_surf, percent_surf.get_rect(center=(sw // 2, progress_y + 20)))
+
         pygame.display.flip()
         pygame.time.wait(30)
 
-        if now - splash_start > wait_time and preload_done.is_set():
-            break
-        
-        # Condition de sortie
         if elapsed > wait_time and preload_done.is_set():
             break
-            
-        pygame.time.wait(16)  # 60 FPS
-    
-    # Effet de fade out
+
     for alpha in range(255, 0, -15):
         fade_surf = pygame.Surface((sw, sh))
         fade_surf.fill((0, 0, 0))
@@ -1148,6 +1094,7 @@ class Slider:
         self.text_color = colors["foreground"]
         self.handle_width = 10
         self.dragging = False
+        self.font = pygame.font.SysFont('arial', 18, bold=True)
         self.update_handle_position()
 
     def update_handle_position(self):
@@ -1170,8 +1117,7 @@ class Slider:
     def draw(self, surface):
         draw_rounded_rect(surface, self.bg_color, self.rect, radius=10)
         draw_rounded_rect(surface, self.handle_color, self.handle_rect, radius=5)
-        font = pygame.font.SysFont('bold', 18, bold=True)
-        text = font.render(f"Speed: {int(self.value)}", True, self.text_color)
+        text = self.font.render(f"Speed: {int(self.value)}", True, self.text_color)
         text_rect = text.get_rect(center=(self.rect.centerx, self.rect.y + self.rect.height + 15))
         surface.blit(text, text_rect)
 
@@ -1190,9 +1136,11 @@ class ThumbnailViewer:
         self.bg_color = colors["thumbnail_bg"]
         self.text_color = colors["foreground"]
         self.cache_dir = cache_dir
+        self.colors = colors if colors is not None else {}
+        self.font = pygame.font.SysFont('arial', 18, bold=True)
         self.generate_thumbnails(lazy=True)
         self.calculate_layout()
-        self.colors = colors if colors is not None else {}
+        
 
 
     def generate_thumbnails(self, lazy=False):
@@ -1269,7 +1217,7 @@ class ThumbnailViewer:
             return
         draw_rounded_rect(surface, self.bg_color, self.rect, radius=10, shadow=True)
         visible_indices = self.get_visible_indices()
-        font = pygame.font.SysFont('bold', 18, bold=True)
+        self.font
         for i in visible_indices:
             thumb_key = self.thumbnails[i]
             cached = self.cache.get(thumb_key)
@@ -1327,7 +1275,7 @@ class ThumbnailViewer:
         surface.set_clip(self.rect)
         
         visible_indices = self.get_visible_indices()
-        font = pygame.font.SysFont('bold', 18, bold=True)
+        self.font
         for i in visible_indices:
             thumb_key = self.thumbnails[i]
             cached = self.cache.get(thumb_key)
@@ -1949,7 +1897,12 @@ class ModernProgressBar:
         self.radius = radius
         self.progress = 0.0
         self.animation_offset = 0.0
-        self.colors = colors if colors else load_wal_colors()  # Charger les couleurs par défaut si none
+        self.colors = colors if colors else load_wal_colors()
+        self._percent_font = pygame.font.SysFont('arial', 16, bold=True)  # ← une fois
+        self._bubble_font = None
+        self._bubble_radius_cached = None
+        self._center_font = None
+        self._center_size_cached = None
 
     def draw(self, surface, progress, current_page, total_pages, show_text=True):
         self.progress += (progress - self.progress) * 0.2
@@ -1997,7 +1950,10 @@ class ModernProgressBar:
         surface.blit(grad_surf, (rect.x, rect.y))
 
     def _draw_progress_bubble(self, surface, inner_rect, fill_width, percent):
-        bubble_radius = inner_rect.height // 2 + 4  # Taille ajustée
+        bubble_radius = inner_rect.height // 2 + 4
+        if bubble_radius != self._bubble_radius_cached:
+            self._bubble_font = pygame.font.SysFont('arial', int(bubble_radius * 1.4), bold=True)
+            self._bubble_radius_cached = bubble_radius
         cx = inner_rect.x + fill_width
         cy = inner_rect.centery
         shadow_surf = pygame.Surface((bubble_radius * 2 + 6, bubble_radius * 2 + 6), pygame.SRCALPHA)
@@ -2008,21 +1964,18 @@ class ModernProgressBar:
         surface.blit(bubble_bg, (cx - bubble_radius - 3, cy - bubble_radius - 3))
         pygame.draw.circle(surface, self.colors["progress_bar_right"], (cx, cy), bubble_radius)
         pygame.draw.circle(surface, (*self.colors["progress_bar_right"], 220), (cx, cy), bubble_radius, width=2)
-        font = pygame.font.SysFont('arial', int(bubble_radius * 1.4), bold=True)  # Légèrement réduit pour éviter le débordement
-        percent_text = f"{percent}%"
-        text_surface = font.render(percent_text, True, self.colors["slider_handle"])
-        text_rect = text_surface.get_rect(center=(cx, cy))
-        surface.blit(text_surface, text_rect)
+        text_surface = self._bubble_font.render(f"{percent}%", True, self.colors["slider_handle"])
+        surface.blit(text_surface, text_surface.get_rect(center=(cx, cy)))
 
     def _draw_center_text(self, surface, rect, percent):
-        if not rect:  # Vérification pour éviter les erreurs si rect est None ou invalide
-            logging.error("Rect non défini dans _draw_center_text")
+        if not rect:
             return
-        font = pygame.font.SysFont('arial', int(rect.height * 0.7), bold=True)
-        percent_text = f"{percent}%"
-        text_surface = font.render(percent_text, True, self.colors.get("progress_bar_bg", (255, 255, 255)))
-        text_rect = text_surface.get_rect(center=rect.center)
-        surface.blit(text_surface, text_rect)
+        size = int(rect.height * 0.7)
+        if size != self._center_size_cached:
+            self._center_font = pygame.font.SysFont('arial', size, bold=True)
+            self._center_size_cached = size
+        text_surface = self._center_font.render(f"{percent}%", True, self.colors.get("progress_bar_bg", (255, 255, 255)))
+        surface.blit(text_surface, text_surface.get_rect(center=rect.center))
 
     def draw(self, surface, progress, current_page, total_pages, show_text=True):
         self.progress += (progress - self.progress) * 0.2
