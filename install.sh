@@ -122,22 +122,70 @@ echo -e "${YELLOW}Installation des dépendances Python...${NC}"
 
 case $DISTRO in
     arch)
-        echo -e "${YELLOW}Installation des packages Python avec pacman sur Arch Linux...${NC}"
-        sudo pacman -S --noconfirm python-requests python-beautifulsoup4 python-pillow python-lxml || {
-            echo -e "${RED}Erreur lors de l'installation avec pacman${NC}"
-            echo -e "${YELLOW}Installation de pipx comme alternative...${NC}"
-            sudo pacman -S --noconfirm python-pipx
-            pipx install requests
-            pipx install beautifulsoup4
-            pipx install pillow
-            pipx install cloudscraper
-            pipx install lxml
+        echo -e "${YELLOW}Installation des paquets Python depuis les dépôts officiels...${NC}"
+
+        # Disponibles dans extra/. --needed évite de tout réinstaller à chaque
+        # exécution du script.
+        PACMAN_PKGS=(
+            python-requests         # webtoon-dl : requêtes HTTP
+            python-beautifulsoup4   # webtoon-dl : analyse du HTML
+            python-lxml             # webtoon-dl : parseur rapide pour BeautifulSoup
+            python-pillow           # les deux : traitement des images
+            python-pygame           # manga-live : rendu du lecteur
+            python-rarfile          # manga-live : lecture des archives .cbr
+            tk                      # manga-live : sélecteur de fichiers (tkinter)
+            poppler                 # manga-live : fournit pdftoppm, requis par pdf2image
+            unrar                   # manga-live : décompression effective des .cbr
+        )
+        sudo pacman -S --needed --noconfirm "${PACMAN_PKGS[@]}" || {
+            echo -e "${RED}Échec de l'installation avec pacman.${NC}"
+            exit 1
         }
+
+        # Ces deux-là ne sont pas dans les dépôts officiels : ils vivent dans l'AUR.
+        AUR_PKGS=(
+            python-pdf2image        # manga-live : conversion des PDF en images
+            python-cloudscraper     # webtoon-dl : contournement de la protection Cloudflare
+        )
+
+        AUR_HELPER=""
+        for helper in yay paru pikaur trizen; do
+            if command -v "$helper" &> /dev/null; then
+                AUR_HELPER="$helper"
+                break
+            fi
+        done
+
+        if [ -n "$AUR_HELPER" ]; then
+            echo -e "${YELLOW}Installation des paquets AUR avec $AUR_HELPER...${NC}"
+            "$AUR_HELPER" -S --needed --noconfirm "${AUR_PKGS[@]}" || {
+                echo -e "${RED}Échec de l'installation depuis l'AUR.${NC}"
+                exit 1
+            }
+        else
+            # Sans assistant AUR, on compile à la main. pip --user ne fonctionne
+            # pas ici : Arch marque son Python comme « externally managed ».
+            echo -e "${YELLOW}Aucun assistant AUR détecté. Compilation manuelle...${NC}"
+            sudo pacman -S --needed --noconfirm base-devel git || exit 1
+            BUILD_DIR=$(mktemp -d)
+            for pkg in "${AUR_PKGS[@]}"; do
+                echo -e "${YELLOW}Construction de $pkg...${NC}"
+                git clone --depth 1 "https://aur.archlinux.org/$pkg.git" "$BUILD_DIR/$pkg" || exit 1
+                (cd "$BUILD_DIR/$pkg" && makepkg -si --noconfirm) || {
+                    echo -e "${RED}Échec de la construction de $pkg.${NC}"
+                    echo -e "${YELLOW}Installez un assistant AUR (yay ou paru) puis relancez.${NC}"
+                    exit 1
+                }
+            done
+            rm -rf "$BUILD_DIR"
+        fi
         ;;
     *)
-        python3 -m pip install --user requests beautifulsoup4 pillow cloudscraper lxml || {
+        PIP_PKGS="requests beautifulsoup4 pillow cloudscraper lxml pygame rarfile pdf2image"
+        python3 -m pip install --user $PIP_PKGS || {
             echo -e "${RED}Erreur lors de l'installation des dépendances Python${NC}"
-            echo -e "${YELLOW}Essayez d'installer manuellement : python3 -m pip install --user requests beautifulsoup4 pillow cloudscraper lxml${NC}"
+            echo -e "${YELLOW}Essayez manuellement : python3 -m pip install --user $PIP_PKGS${NC}"
+            echo -e "${YELLOW}Note : pdf2image requiert aussi poppler-utils, et rarfile requiert unrar.${NC}"
             exit 1
         }
         ;;
