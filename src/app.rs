@@ -77,6 +77,13 @@ pub struct App {
     pub last_mouse_scroll: Instant,
     pub image_cache: HashMap<PathBuf, (u32, u32, DynamicImage, u64)>, // Un seul champ avec 4 éléments
     pub source_link_area: Option<Rect>,
+    /// Zones occupées par les listes au dernier rendu, et décalage de leur
+    /// `ListState`. Renseignés par `ui_modern`, indispensables pour convertir
+    /// la ligne d'un clic en index d'élément.
+    pub manga_list_area: Option<Rect>,
+    pub chapter_list_area: Option<Rect>,
+    pub manga_list_offset: usize,
+    pub chapter_list_offset: usize,
     #[allow(dead_code)]
     pub image_load_sender: crossbeam_channel::Sender<(usize, Option<PathBuf>)>,
     #[allow(dead_code)]
@@ -179,6 +186,10 @@ impl App {
             last_mouse_scroll: Instant::now().checked_sub(Duration::from_millis(120)).unwrap_or_else(Instant::now),
             image_cache: HashMap::new(),
             source_link_area: None,
+            manga_list_area: None,
+            chapter_list_area: None,
+            manga_list_offset: 0,
+            chapter_list_offset: 0,
             image_load_sender: tx,
             image_load_receiver: result_rx,
             pending_image_load: None,
@@ -425,6 +436,45 @@ impl App {
             0.0
         };
         (read, total, progress)
+    }
+
+    /// Convertit la ligne d'un clic en index d'élément dans une liste.
+    ///
+    /// Les listes sont dessinées dans un bloc `Borders::ALL` : la première
+    /// ligne d'élément est donc `area.y + 1`, et la dernière ligne de la zone
+    /// est la bordure basse. Un clic sur une bordure ne sélectionne rien.
+    fn list_row_to_index(area: Rect, row: u16, offset: usize) -> Option<usize> {
+        const BORDER_TOP: u16 = 1;
+        const BORDER_BOTTOM: u16 = 1;
+
+        if area.height <= BORDER_TOP + BORDER_BOTTOM {
+            return None;
+        }
+        let first = area.y + BORDER_TOP;
+        let last = area.y + area.height - BORDER_BOTTOM; // exclusif
+        if row < first || row >= last {
+            return None;
+        }
+        Some(offset + (row - first) as usize)
+    }
+
+    /// Indices réels (dans `self.mangas`) des mangas passant le filtre.
+    ///
+    /// Même prédicat que `filtered_mangas()`, afin que la position d'une ligne
+    /// affichée corresponde bien à l'entrée renvoyée ici.
+    fn filtered_manga_indices(&self) -> Vec<usize> {
+        self.mangas
+            .iter()
+            .enumerate()
+            .filter(|(_, manga)| {
+                if self.filter.is_empty() {
+                    true
+                } else {
+                    manga.name.to_lowercase().contains(&self.filter.to_lowercase())
+                }
+            })
+            .map(|(idx, _)| idx)
+            .collect()
     }
 
     pub fn open_external(&mut self) -> Result<()> {
@@ -1124,6 +1174,72 @@ impl App {
                             }
                         }
                     }
+
+                    let position = ratatui::layout::Position {
+                        x: mouse_event.column,
+                        y: mouse_event.row,
+                    };
+
+                    // Tap sur la bibliothèque : sélectionne le manga survolé.
+                    if let Some(area) = self.manga_list_area {
+                        if area.contains(position) {
+                            if let Some(clicked) = Self::list_row_to_index(
+                                area,
+                                mouse_event.row,
+                                self.manga_list_offset,
+                            ) {
+                                let filtered = self.filtered_manga_indices();
+                                if let Some(&real_idx) = filtered.get(clicked) {
+                                    self.is_manga_list_focused = true;
+                                    if self.selected_manga != Some(real_idx) {
+                                        self.selected_manga = Some(real_idx);
+                                        // Même remise à zéro que la navigation clavier.
+                                        self.selected_chapter = match self.current_manga() {
+                                            Some(manga) if !manga.chapters.is_empty() => Some(0),
+                                            _ => None,
+                                        };
+                                        let _ = self.load_cover_image();
+                                    }
+                                    debug!("Clic liste mangas -> index {:?}", self.selected_manga);
+                                }
+                            }
+                            return false;
+                        }
+                    }
+
+                    // Tap sur les chapitres : premier tap sélectionne, second
+                    // ouvre — à condition que la liste ait déjà le focus, sinon
+                    // un simple passage depuis la bibliothèque ouvrirait le
+                    // chapitre présélectionné sans qu'on l'ait jamais touché.
+                    if let Some(area) = self.chapter_list_area {
+                        if area.contains(position) {
+                            if let Some(clicked) = Self::list_row_to_index(
+                                area,
+                                mouse_event.row,
+                                self.chapter_list_offset,
+                            ) {
+                                let chapter_count = self
+                                    .current_manga()
+                                    .map(|manga| manga.chapters.len())
+                                    .unwrap_or(0);
+                                if clicked < chapter_count {
+                                    let already_focused = !self.is_manga_list_focused;
+                                    let already_selected = self.selected_chapter == Some(clicked);
+                                    self.is_manga_list_focused = false;
+                                    self.selected_chapter = Some(clicked);
+
+                                    if already_focused && already_selected {
+                                        debug!("Second tap sur le chapitre {} : ouverture", clicked);
+                                        if let Err(e) = self.open_external() {
+                                            self.status = format!("Erreur: {}", e);
+                                        }
+                                    }
+                                }
+                            }
+                            return false;
+                        }
+                    }
+
                     false
                 }
                 MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
@@ -1795,5 +1911,52 @@ mod download_progress_tests {
         assert!(p.finished);
         assert_eq!(p.global_percent(), 100.0);
         assert_eq!(p.summary(), "1 chapitre(s) téléchargé(s)");
+    }
+}
+
+#[cfg(test)]
+mod click_mapping_tests {
+    use super::*;
+
+    /// Liste de 10 lignes en (0,0) : bordure haute en y=0, éléments de y=1
+    /// à y=8, bordure basse en y=9.
+    fn area() -> Rect {
+        Rect::new(0, 0, 30, 10)
+    }
+
+    #[test]
+    fn la_premiere_ligne_dinterieur_donne_lindex_zero() {
+        assert_eq!(App::list_row_to_index(area(), 1, 0), Some(0));
+        assert_eq!(App::list_row_to_index(area(), 2, 0), Some(1));
+    }
+
+    #[test]
+    fn les_bordures_ne_selectionnent_rien() {
+        assert_eq!(App::list_row_to_index(area(), 0, 0), None); // bordure haute
+        assert_eq!(App::list_row_to_index(area(), 9, 0), None); // bordure basse
+        assert_eq!(App::list_row_to_index(area(), 42, 0), None); // hors zone
+    }
+
+    #[test]
+    fn le_decalage_de_la_liste_est_pris_en_compte() {
+        // Liste défilée de 20 crans : la première ligne visible est l'élément 20.
+        assert_eq!(App::list_row_to_index(area(), 1, 20), Some(20));
+        assert_eq!(App::list_row_to_index(area(), 3, 20), Some(22));
+    }
+
+    #[test]
+    fn une_zone_decalee_a_lecran_reste_juste() {
+        // Panneau de droite : commence en x=40, y=5.
+        let right = Rect::new(40, 5, 30, 10);
+        assert_eq!(App::list_row_to_index(right, 5, 0), None); // bordure haute
+        assert_eq!(App::list_row_to_index(right, 6, 0), Some(0));
+        assert_eq!(App::list_row_to_index(right, 13, 0), Some(7));
+        assert_eq!(App::list_row_to_index(right, 14, 0), None); // bordure basse
+    }
+
+    #[test]
+    fn une_zone_trop_petite_ne_plante_pas() {
+        assert_eq!(App::list_row_to_index(Rect::new(0, 0, 10, 2), 1, 0), None);
+        assert_eq!(App::list_row_to_index(Rect::new(0, 0, 10, 0), 0, 0), None);
     }
 }

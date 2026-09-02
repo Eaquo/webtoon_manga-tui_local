@@ -282,6 +282,10 @@ fn draw_modern_browse(f: &mut Frame, app: &mut App, area: Rect, colors: &Wallust
 }
 
 fn draw_modern_manga_list(f: &mut Frame, app: &mut App, area: Rect, colors: &WallustColors) {
+    // Le bloc délimite les emprunts immuables sur `app` : la zone et le
+    // décalage ne peuvent être mémorisés qu'une fois ces emprunts relâchés.
+    let rendered_offset;
+    {
     let filtered_mangas_vec: Vec<&Manga> = app.filtered_mangas().collect();
     
     let items: Vec<ListItem> = filtered_mangas_vec
@@ -369,9 +373,19 @@ fn draw_modern_manga_list(f: &mut Frame, app: &mut App, area: Rect, colors: &Wal
         }
     }
     f.render_stateful_widget(manga_list, area, &mut state);
+    // `render_stateful_widget` ajuste l'offset pour rendre la sélection
+    // visible : on le relit après coup, pas avant.
+    rendered_offset = state.offset();
+    }
+
+    // Mémorisés pour convertir une ligne cliquée en index (voir handle_key).
+    app.manga_list_area = Some(area);
+    app.manga_list_offset = rendered_offset;
 }
 
 fn draw_modern_chapter_list(f: &mut Frame, app: &mut App, area: Rect, colors: &WallustColors) {
+    let mut rendered_offset = None;
+    {
     let border_color = if !app.is_manga_list_focused {
         colors.border_focus
     } else {
@@ -446,6 +460,7 @@ fn draw_modern_chapter_list(f: &mut Frame, app: &mut App, area: Rect, colors: &W
             }
         }
         f.render_stateful_widget(chapter_list, area, &mut chapter_state);
+        rendered_offset = Some(chapter_state.offset());
     } else {
         let empty_widget = Paragraph::new(format!("{} Aucun manga sélectionné", Icons::FOLDER))
             .style(Style::default().fg(ModernColors::TEXT_MUTED))
@@ -458,6 +473,13 @@ fn draw_modern_chapter_list(f: &mut Frame, app: &mut App, area: Rect, colors: &W
                     .border_style(Style::default().fg(border_color))
             );
         f.render_widget(empty_widget, area);
+    }
+    }
+
+    // Mémorisés pour convertir une ligne cliquée en index (voir handle_key).
+    app.chapter_list_area = Some(area);
+    if let Some(offset) = rendered_offset {
+        app.chapter_list_offset = offset;
     }
 }
 
