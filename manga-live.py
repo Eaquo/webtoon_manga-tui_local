@@ -37,6 +37,17 @@ os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
 os.environ['SDL_LOGGING'] = '0'
 os.environ['SDL_VIDEODRIVER'] = os.environ.get('XDG_SESSION_TYPE', 'wayland')
 
+# --- Défilement tactile -----------------------------------------------------
+# SDL synthétise déjà un clic souris depuis un appui tactile, ce qui rend les
+# boutons « tapables ». On ne désactive donc surtout pas cette synthèse : on se
+# contente de n'interpréter un contact comme un glissement qu'au-delà d'un
+# petit seuil, pour ne pas confondre un tap avec un défilement.
+TOUCH_DRAG_THRESHOLD = 8        # px parcourus avant de considérer un glissement
+TOUCH_PAGE_TURN_RATIO = 0.15    # fraction de l'écran pour tourner une page
+TOUCH_MOMENTUM_DECAY = 0.92     # décélération de l'inertie, par image
+TOUCH_MOMENTUM_MIN = 0.5        # en dessous, on arrête l'inertie
+
+
 def load_wal_colors():
     """Charge les couleurs depuis ~/.cache/wal/wal.json ou retourne les couleurs par défaut."""
     default_colors = {
@@ -2439,6 +2450,12 @@ def run_reader(archive_path, start_page=1, cache_dir=None, initial_opacity=0):
         config_menu = ConfigMenu(screen_width, screen_height, colors)
         running = True
         is_scrolling = False
+        # Suivi du doigt entre FINGERDOWN et FINGERUP.
+        touch_active = False
+        touch_dragging = False       # vrai une fois le seuil franchi
+        touch_total_dx = 0.0
+        touch_total_dy = 0.0
+        touch_momentum = 0.0         # vitesse résiduelle en webtoon
         last_scroll_time = pygame.time.get_ticks() / 1000.0
         thumbnail_viewer.scroll_to_current_page(current_page)
         t0 = print_timing("Initialisation des widgets UI", t0)
@@ -2495,6 +2512,46 @@ def run_reader(archive_path, start_page=1, cache_dir=None, initial_opacity=0):
                     running = False
                 elif event.type == pygame.VIDEORESIZE:
                     update_layout()
+
+                elif event.type == pygame.FINGERDOWN:
+                    touch_active = True
+                    touch_dragging = False
+                    touch_total_dx = 0.0
+                    touch_total_dy = 0.0
+                    touch_momentum = 0.0
+
+                elif event.type == pygame.FINGERMOTION and touch_active:
+                    # dx/dy sont normalisés ([-1..1], fraction de la fenêtre).
+                    dx_px = event.dx * screen_width
+                    dy_px = event.dy * screen_height
+                    touch_total_dx += dx_px
+                    touch_total_dy += dy_px
+
+                    if not touch_dragging and max(abs(touch_total_dx), abs(touch_total_dy)) > TOUCH_DRAG_THRESHOLD:
+                        touch_dragging = True
+
+                    if touch_dragging and mode == 'webtoon':
+                        # Glisser vers le haut fait défiler vers le bas.
+                        max_offset = max(0, webtoon_renderer.total_height - screen_height)
+                        scroll_offset = max(0, min(scroll_offset - dy_px, max_offset))
+                        touch_momentum = -dy_px
+
+                elif event.type == pygame.FINGERUP and touch_active:
+                    touch_active = False
+                    if touch_dragging and mode == 'manga':
+                        # En mode manga, on tourne la page si le glissement
+                        # dépasse une fraction de l'écran, sur l'axe dominant.
+                        if abs(touch_total_dy) >= abs(touch_total_dx):
+                            travel, span = touch_total_dy, screen_height
+                        else:
+                            travel, span = touch_total_dx, screen_width
+                        if abs(travel) > span * TOUCH_PAGE_TURN_RATIO:
+                            # Vers le haut ou vers la gauche : page suivante.
+                            if travel < 0:
+                                manga_renderer.next_page()
+                            else:
+                                manga_renderer.prev_page()
+                    touch_dragging = False
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_c:
                         config_menu.visible = not config_menu.visible
@@ -2793,6 +2850,14 @@ def run_reader(archive_path, start_page=1, cache_dir=None, initial_opacity=0):
                     if is_scrolling:
                         play_speed = speed_slider.value
                         scroll_offset = min(scroll_offset + play_speed * delta_time, max(0, webtoon_renderer.total_height - screen_height))
+                    # Inertie : le défilement se poursuit brièvement après que
+                    # le doigt a quitté l'écran, puis s'amortit.
+                    if not touch_active and abs(touch_momentum) > TOUCH_MOMENTUM_MIN:
+                        max_offset = max(0, webtoon_renderer.total_height - screen_height)
+                        scroll_offset = max(0, min(scroll_offset + touch_momentum, max_offset))
+                        touch_momentum *= TOUCH_MOMENTUM_DECAY
+                        if scroll_offset <= 0 or scroll_offset >= max_offset:
+                            touch_momentum = 0.0
                 elif mode == 'manga':
                     if keys[pygame.K_DOWN] or keys[pygame.K_s]:
                         manga_renderer.next_page()
