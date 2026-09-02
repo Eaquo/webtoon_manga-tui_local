@@ -285,6 +285,7 @@ fn draw_modern_manga_list(f: &mut Frame, app: &mut App, area: Rect, colors: &Wal
     // Le bloc délimite les emprunts immuables sur `app` : la zone et le
     // décalage ne peuvent être mémorisés qu'une fois ces emprunts relâchés.
     let rendered_offset;
+    let captured_item_height;
     {
     let filtered_mangas_vec: Vec<&Manga> = app.filtered_mangas().collect();
     
@@ -349,6 +350,8 @@ fn draw_modern_manga_list(f: &mut Frame, app: &mut App, area: Rect, colors: &Wal
         colors.border
     };
     
+    let item_height = items.first().map(|i| i.height() as u16).unwrap_or(1).max(1);
+
     let manga_list = List::new(items)
         .block(
             Block::default()
@@ -376,15 +379,18 @@ fn draw_modern_manga_list(f: &mut Frame, app: &mut App, area: Rect, colors: &Wal
     // `render_stateful_widget` ajuste l'offset pour rendre la sélection
     // visible : on le relit après coup, pas avant.
     rendered_offset = state.offset();
+    captured_item_height = item_height;
     }
 
     // Mémorisés pour convertir une ligne cliquée en index (voir handle_key).
     app.manga_list_area = Some(area);
     app.manga_list_offset = rendered_offset;
+    app.manga_list_item_height = captured_item_height;
 }
 
 fn draw_modern_chapter_list(f: &mut Frame, app: &mut App, area: Rect, colors: &WallustColors) {
     let mut rendered_offset = None;
+    let mut item_height = 1u16;
     {
     let border_color = if !app.is_manga_list_focused {
         colors.border_focus
@@ -436,6 +442,8 @@ fn draw_modern_chapter_list(f: &mut Frame, app: &mut App, area: Rect, colors: &W
             .collect();
 
         let display_name = manga.name.replace("_", " ");
+        item_height = items.first().map(|i| i.height() as u16).unwrap_or(1).max(1);
+
         let chapter_list = List::new(items)
             .block(
                 Block::default()
@@ -480,6 +488,7 @@ fn draw_modern_chapter_list(f: &mut Frame, app: &mut App, area: Rect, colors: &W
     app.chapter_list_area = Some(area);
     if let Some(offset) = rendered_offset {
         app.chapter_list_offset = offset;
+        app.chapter_list_item_height = item_height;
     }
 }
 

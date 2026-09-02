@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use dirs::config_dir;
@@ -16,6 +16,13 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub last_manga_dir: Option<PathBuf>,
+    /// Ancienne liste des chapitres lus, en chemins absolus.
+    ///
+    /// N'est plus alimentée : l'état « lu » vit dans la colonne `read` de la
+    /// table `chapters`, indexée sur (nom du manga, numéro) et donc insensible
+    /// au déplacement de la bibliothèque. Le champ subsiste le temps que
+    /// `migrate_legacy_read_chapters` reprenne les entrées héritées, après quoi
+    /// il reste vide.
     pub read_chapters: HashSet<String>,
     pub open_command: Option<String>,
     pub settings: Settings,
@@ -133,7 +140,9 @@ impl Config {
         // Écriture atomique : on écrit à côté puis on renomme. Une coupure en
         // cours d'écriture laisse ainsi l'ancienne config intacte plutôt qu'un
         // fichier tronqué (donc illisible, donc des chapitres lus perdus).
-        let tmp_path = config_path.with_extension("json.tmp");
+        // Nom unique : un nom fixe ferait se percuter deux écritures
+        // simultanées, la seconde renommant un fichier déjà consommé.
+        let tmp_path = config_path.with_extension(format!("json.tmp.{}", std::process::id()));
         fs::write(&tmp_path, config_str).context("Failed to write temporary config file")?;
         fs::rename(&tmp_path, &config_path).context("Failed to replace config file")?;
 
@@ -148,19 +157,6 @@ impl Config {
         Ok(config_dir)
     }
 
-    pub fn mark_chapter_as_read<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path_str = path.as_ref().to_string_lossy().to_string();
-        self.read_chapters.insert(path_str);
-        self.save()?;
-        Ok(())
-    }
-
-    pub fn mark_chapter_as_unread<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        let path_str = path.as_ref().to_string_lossy().to_string();
-        self.read_chapters.remove(&path_str);
-        self.save()?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use std::collections::HashMap; // Added import
 use image::DynamicImage; // Added import
 use anyhow::{Result};
 use crossterm::event::{KeyCode, KeyEvent, MouseEventKind};
-use log::{debug, error};
+use log::{debug, error, info};
 use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::image::ImageManager;
@@ -84,6 +84,12 @@ pub struct App {
     pub chapter_list_area: Option<Rect>,
     pub manga_list_offset: usize,
     pub chapter_list_offset: usize,
+    /// Hauteur d'un élément, en lignes. Les items ne font pas une ligne :
+    /// 3 pour la bibliothèque, 2 pour les chapitres. Relevée au rendu sur
+    /// l'item réel, pour que la conversion suive automatiquement toute
+    /// évolution de la mise en page.
+    pub manga_list_item_height: u16,
+    pub chapter_list_item_height: u16,
     #[allow(dead_code)]
     pub image_load_sender: crossbeam_channel::Sender<(usize, Option<PathBuf>)>,
     #[allow(dead_code)]
@@ -100,6 +106,20 @@ impl App {
         debug!("Creating new app with manga_dir: {:?}", manga_dir);
         
         let mut config = Config::load()?;
+        match crate::manga_indexer::open_db()
+            .and_then(|conn| Self::migrate_legacy_read_chapters(&conn, &mut config))
+        {
+            Ok(n) => {
+                if n > 0 {
+                    info!("{} chapitre(s) lus récupérés depuis l'ancienne config", n);
+                }
+                // La liste héritée a été vidée : on le grave sur disque.
+                if let Err(e) = config.save() {
+                    error!("Sauvegarde de la config après migration impossible : {}", e);
+                }
+            }
+            Err(e) => error!("Migration des chapitres lus impossible : {}", e),
+        }
 
         // Certains terminaux ne rapportent pas leur taille en pixels : le
         // Picker échoue alors avec « font_size zero value ». Ce n'était une
@@ -190,6 +210,8 @@ impl App {
             chapter_list_area: None,
             manga_list_offset: 0,
             chapter_list_offset: 0,
+            manga_list_item_height: 1,
+            chapter_list_item_height: 1,
             image_load_sender: tx,
             image_load_receiver: result_rx,
             pending_image_load: None,
@@ -393,12 +415,9 @@ impl App {
         if let (Some(manga_idx), Some(chapter_idx)) = (self.selected_manga, self.selected_chapter) {
             if let Some(manga) = self.mangas.get_mut(manga_idx) {
                 if let Some(chapter) = manga.chapters.get_mut(chapter_idx) {
-                    let path = chapter.path.clone();
+                    
                     let manga_name = manga.name.clone();
-                    if read {
-                        self.config.mark_chapter_as_read(&path)?;
-                    } else {
-                        self.config.mark_chapter_as_unread(&path)?;
+                    if !read {
                         // Réinitialiser last_page_read à None quand le chapitre devient non lu
                         chapter.last_page_read = None;
                     }
@@ -438,12 +457,54 @@ impl App {
         (read, total, progress)
     }
 
+    /// Reprend l'état « lu » de l'ancienne liste `config.read_chapters`.
+    ///
+    /// Ce champ était écrit à chaque marquage mais n'a jamais été relu : ni par
+    /// le Rust (`load_all_from_db` ignore la config), ni par manga-live, qui
+    /// écrit directement en base. C'était donc un doublon mort — mais un
+    /// doublon qui avait conservé des chapitres que la base avait perdus lors
+    /// d'un réindexage. On les réinjecte une fois, puis on vide la liste.
+    ///
+    /// Ne sauvegarde pas la config : c'est à l'appelant de le faire, pour que
+    /// la fonction reste testable sans toucher au disque.
+    ///
+    /// Idempotent : une fois vidée, la fonction ne fait plus rien.
+    fn migrate_legacy_read_chapters(
+        conn: &rusqlite::Connection,
+        config: &mut Config,
+    ) -> Result<usize> {
+        if config.read_chapters.is_empty() {
+            return Ok(0);
+        }
+
+        let legacy_count = config.read_chapters.len();
+        let mut recovered = 0usize;
+
+        for path in &config.read_chapters {
+            // La base est indexée sur (nom de manga, numéro) et son champ
+            // `file` est réécrit à chaque scan : un chemin obsolète ne
+            // correspondra simplement à rien, sans provoquer d'erreur.
+            recovered += conn.execute(
+                "UPDATE chapters SET read = 1 WHERE file = ?1 AND read = 0",
+                [path],
+            )?;
+        }
+
+        debug!(
+            "Migration : {} entrées héritées, {} chapitre(s) repassés en lu",
+            legacy_count, recovered
+        );
+
+        config.read_chapters.clear();
+        Ok(recovered)
+    }
+
     /// Convertit la ligne d'un clic en index d'élément dans une liste.
     ///
     /// Les listes sont dessinées dans un bloc `Borders::ALL` : la première
     /// ligne d'élément est donc `area.y + 1`, et la dernière ligne de la zone
     /// est la bordure basse. Un clic sur une bordure ne sélectionne rien.
-    fn list_row_to_index(area: Rect, row: u16, offset: usize) -> Option<usize> {
+    fn list_row_to_index(area: Rect, row: u16, offset: usize, item_height: u16) -> Option<usize> {
         const BORDER_TOP: u16 = 1;
         const BORDER_BOTTOM: u16 = 1;
 
@@ -455,7 +516,11 @@ impl App {
         if row < first || row >= last {
             return None;
         }
-        Some(offset + (row - first) as usize)
+        // Un élément occupe plusieurs lignes : sans cette division, taper le
+        // 2e chapitre renvoyait l'index 4. L'offset du ListState, lui, est
+        // déjà exprimé en éléments.
+        let height = item_height.max(1) as usize;
+        Some(offset + (row - first) as usize / height)
     }
 
     /// Indices réels (dans `self.mangas`) des mangas passant le filtre.
@@ -1128,11 +1193,6 @@ impl App {
                             if let Some(manga) = self.mangas.get_mut(manga_idx) {
                                 let manga_name = manga.name.clone();
                                 for chapter in &mut manga.chapters {
-                                    let path = chapter.path.clone();
-                                    if let Err(e) = self.config.mark_chapter_as_unread(&path) {
-                                        self.status = format!("Erreur: {}", e);
-                                        return false;
-                                    }
                                     chapter.read = false;
                                     chapter.last_page_read = None;
                                     if let Err(e) = chapter.update_progress(
@@ -1187,6 +1247,7 @@ impl App {
                                 area,
                                 mouse_event.row,
                                 self.manga_list_offset,
+                                self.manga_list_item_height,
                             ) {
                                 let filtered = self.filtered_manga_indices();
                                 if let Some(&real_idx) = filtered.get(clicked) {
@@ -1217,6 +1278,7 @@ impl App {
                                 area,
                                 mouse_event.row,
                                 self.chapter_list_offset,
+                                self.chapter_list_item_height,
                             ) {
                                 let chapter_count = self
                                     .current_manga()
@@ -1455,11 +1517,6 @@ impl App {
                     if let Some(manga) = self.mangas.get_mut(manga_idx) {
                         let manga_name = manga.name.clone();
                         for chapter in &mut manga.chapters {
-                            let path = chapter.path.clone();
-                            if let Err(e) = self.config.mark_chapter_as_unread(&path) {
-                                self.status = format!("Erreur: {}", e);
-                                return false;
-                            }
                             chapter.read = false;
                             chapter.last_page_read = None;
                             if let Err(e) = chapter.update_progress(
@@ -1918,7 +1975,7 @@ mod download_progress_tests {
 mod click_mapping_tests {
     use super::*;
 
-    /// Liste de 10 lignes en (0,0) : bordure haute en y=0, éléments de y=1
+    /// Liste de 10 lignes en (0,0) : bordure haute en y=0, contenu de y=1
     /// à y=8, bordure basse en y=9.
     fn area() -> Rect {
         Rect::new(0, 0, 30, 10)
@@ -1926,37 +1983,150 @@ mod click_mapping_tests {
 
     #[test]
     fn la_premiere_ligne_dinterieur_donne_lindex_zero() {
-        assert_eq!(App::list_row_to_index(area(), 1, 0), Some(0));
-        assert_eq!(App::list_row_to_index(area(), 2, 0), Some(1));
+        assert_eq!(App::list_row_to_index(area(), 1, 0, 1), Some(0));
+        assert_eq!(App::list_row_to_index(area(), 2, 0, 1), Some(1));
     }
 
     #[test]
     fn les_bordures_ne_selectionnent_rien() {
-        assert_eq!(App::list_row_to_index(area(), 0, 0), None); // bordure haute
-        assert_eq!(App::list_row_to_index(area(), 9, 0), None); // bordure basse
-        assert_eq!(App::list_row_to_index(area(), 42, 0), None); // hors zone
+        assert_eq!(App::list_row_to_index(area(), 0, 0, 1), None); // bordure haute
+        assert_eq!(App::list_row_to_index(area(), 9, 0, 1), None); // bordure basse
+        assert_eq!(App::list_row_to_index(area(), 42, 0, 1), None); // hors zone
     }
 
     #[test]
     fn le_decalage_de_la_liste_est_pris_en_compte() {
         // Liste défilée de 20 crans : la première ligne visible est l'élément 20.
-        assert_eq!(App::list_row_to_index(area(), 1, 20), Some(20));
-        assert_eq!(App::list_row_to_index(area(), 3, 20), Some(22));
+        assert_eq!(App::list_row_to_index(area(), 1, 20, 1), Some(20));
+        assert_eq!(App::list_row_to_index(area(), 3, 20, 1), Some(22));
     }
 
     #[test]
     fn une_zone_decalee_a_lecran_reste_juste() {
         // Panneau de droite : commence en x=40, y=5.
         let right = Rect::new(40, 5, 30, 10);
-        assert_eq!(App::list_row_to_index(right, 5, 0), None); // bordure haute
-        assert_eq!(App::list_row_to_index(right, 6, 0), Some(0));
-        assert_eq!(App::list_row_to_index(right, 13, 0), Some(7));
-        assert_eq!(App::list_row_to_index(right, 14, 0), None); // bordure basse
+        assert_eq!(App::list_row_to_index(right, 5, 0, 1), None); // bordure haute
+        assert_eq!(App::list_row_to_index(right, 6, 0, 1), Some(0));
+        assert_eq!(App::list_row_to_index(right, 13, 0, 1), Some(7));
+        assert_eq!(App::list_row_to_index(right, 14, 0, 1), None); // bordure basse
     }
 
     #[test]
     fn une_zone_trop_petite_ne_plante_pas() {
-        assert_eq!(App::list_row_to_index(Rect::new(0, 0, 10, 2), 1, 0), None);
-        assert_eq!(App::list_row_to_index(Rect::new(0, 0, 10, 0), 0, 0), None);
+        assert_eq!(App::list_row_to_index(Rect::new(0, 0, 10, 2), 1, 0, 1), None);
+        assert_eq!(App::list_row_to_index(Rect::new(0, 0, 10, 0), 0, 0, 1), None);
+        // Une hauteur d'item nulle ne doit pas provoquer de division par zéro.
+        assert_eq!(App::list_row_to_index(area(), 1, 0, 0), Some(0));
+    }
+
+    #[test]
+    fn un_chapitre_occupe_deux_lignes() {
+        // Bug constaté sur écran tactile : taper le 2e chapitre sélectionnait
+        // le 4e. Les items de la liste chapitres font 2 lignes.
+        assert_eq!(App::list_row_to_index(area(), 1, 0, 2), Some(0)); // 1re ligne du ch. 0
+        assert_eq!(App::list_row_to_index(area(), 2, 0, 2), Some(0)); // 2e ligne du ch. 0
+        assert_eq!(App::list_row_to_index(area(), 3, 0, 2), Some(1)); // 1re ligne du ch. 1
+        assert_eq!(App::list_row_to_index(area(), 4, 0, 2), Some(1));
+        assert_eq!(App::list_row_to_index(area(), 5, 0, 2), Some(2));
+    }
+
+    #[test]
+    fn un_manga_occupe_trois_lignes() {
+        assert_eq!(App::list_row_to_index(area(), 1, 0, 3), Some(0));
+        assert_eq!(App::list_row_to_index(area(), 3, 0, 3), Some(0));
+        assert_eq!(App::list_row_to_index(area(), 4, 0, 3), Some(1));
+        assert_eq!(App::list_row_to_index(area(), 7, 0, 3), Some(2));
+    }
+
+    #[test]
+    fn hauteur_et_decalage_se_combinent() {
+        // Liste chapitres défilée de 10 éléments : l'offset est en éléments,
+        // pas en lignes — il ne doit donc pas être divisé.
+        assert_eq!(App::list_row_to_index(area(), 1, 10, 2), Some(10));
+        assert_eq!(App::list_row_to_index(area(), 3, 10, 2), Some(11));
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Base minimale reproduisant la table `chapters` réelle.
+    fn db_avec(chapitres: &[(&str, i32)]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE chapters (id INTEGER PRIMARY KEY, file TEXT, read INTEGER DEFAULT 0)",
+            [],
+        )
+        .unwrap();
+        for (file, read) in chapitres {
+            conn.execute(
+                "INSERT INTO chapters (file, read) VALUES (?1, ?2)",
+                rusqlite::params![file, read],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    fn lus(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM chapters WHERE read = 1", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn les_chapitres_connus_de_la_seule_config_sont_recuperes() {
+        let conn = db_avec(&[("/scan/a/001.cbz", 0), ("/scan/a/002.cbz", 0)]);
+        let mut config = Config::default();
+        config.read_chapters.insert("/scan/a/001.cbz".to_string());
+
+        let recovered = App::migrate_legacy_read_chapters(&conn, &mut config).unwrap();
+        assert_eq!(recovered, 1);
+        assert_eq!(lus(&conn), 1);
+    }
+
+    #[test]
+    fn un_chemin_obsolete_est_ignore_sans_erreur() {
+        // Cas réel : 26 des 45 entrées visaient des fichiers supprimés depuis.
+        let conn = db_avec(&[("/scan/a/001.cbz", 0)]);
+        let mut config = Config::default();
+        config.read_chapters.insert("/ancien/chemin/disparu.cbz".to_string());
+
+        let recovered = App::migrate_legacy_read_chapters(&conn, &mut config).unwrap();
+        assert_eq!(recovered, 0);
+        assert_eq!(lus(&conn), 0);
+    }
+
+    #[test]
+    fn un_chapitre_deja_lu_nest_pas_recompte() {
+        let conn = db_avec(&[("/scan/a/001.cbz", 1)]);
+        let mut config = Config::default();
+        config.read_chapters.insert("/scan/a/001.cbz".to_string());
+
+        let recovered = App::migrate_legacy_read_chapters(&conn, &mut config).unwrap();
+        assert_eq!(recovered, 0, "déjà lu : rien à récupérer");
+        assert_eq!(lus(&conn), 1);
+    }
+
+    #[test]
+    fn la_migration_est_idempotente() {
+        let conn = db_avec(&[("/scan/a/001.cbz", 0)]);
+        let mut config = Config::default();
+        config.read_chapters.insert("/scan/a/001.cbz".to_string());
+
+        assert_eq!(App::migrate_legacy_read_chapters(&conn, &mut config).unwrap(), 1);
+        assert!(config.read_chapters.is_empty(), "la liste est vidée");
+        // Second passage : plus rien à faire.
+        assert_eq!(App::migrate_legacy_read_chapters(&conn, &mut config).unwrap(), 0);
+        assert_eq!(lus(&conn), 1);
+    }
+
+    #[test]
+    fn une_config_vide_ne_touche_pas_la_base() {
+        let conn = db_avec(&[("/scan/a/001.cbz", 0)]);
+        let mut config = Config::default();
+        assert_eq!(App::migrate_legacy_read_chapters(&conn, &mut config).unwrap(), 0);
+        assert_eq!(lus(&conn), 0);
     }
 }
