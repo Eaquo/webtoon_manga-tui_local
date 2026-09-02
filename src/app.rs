@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::image::ImageManager;
 use crate::manga::Manga;
 use crate::theme::Theme;
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use crate::event::Event;
 use ratatui::layout::Rect;
@@ -99,6 +99,10 @@ pub struct App {
     pub last_cover_load: Instant,
     pub last_selection_change: Instant,
     pub render_image: bool,
+    /// Protocole graphique retenu par ratatui-image. `Halfblocks` signifie
+    /// que le terminal n'en supporte aucun : l'« image » ne serait alors
+    /// qu'un damier de demi-blocs colorés, illisible pour une couverture.
+    pub image_protocol: ProtocolType,
 }
 
 impl App {
@@ -139,6 +143,8 @@ impl App {
             }
         };
         image_picker.guess_protocol();
+        let image_protocol = image_picker.protocol_type;
+        debug!("Protocole graphique détecté : {:?}", image_protocol);
 
         let download_url = config.last_download_url.clone().unwrap_or_default();
         let selected_chapters_input = config
@@ -218,6 +224,7 @@ impl App {
             last_cover_load: Instant::now(),
             last_selection_change: Instant::now(),
             render_image: true,
+            image_protocol,
         };
         
         app.refresh_manga_list()?;

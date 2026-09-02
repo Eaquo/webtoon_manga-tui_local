@@ -528,7 +528,12 @@ fn draw_modern_cover_image(f: &mut Frame, app: &mut App, area: Rect, _colors: &W
     f.render_widget(&cover_block, area);
     let inner_area = cover_block.inner(area);
 
-    if app.render_image && app.config.settings.enable_image_rendering {
+    // Sans protocole graphique, ratatui-image se rabat sur des demi-blocs :
+    // une couverture y devient une bouillie de pixels colorés. On préfère
+    // afficher une fiche sobre, qui reste lisible et informative.
+    if app.image_protocol == ratatui_image::picker::ProtocolType::Halfblocks {
+        draw_cover_fallback(f, app, inner_area);
+    } else if app.render_image && app.config.settings.enable_image_rendering {
         if let Some(state) = &mut app.image_state {
             let image_widget = StatefulImage::new(None);
             f.render_stateful_widget(image_widget, inner_area, state);
@@ -552,6 +557,62 @@ fn draw_modern_cover_image(f: &mut Frame, app: &mut App, area: Rect, _colors: &W
             .alignment(Alignment::Center);
         f.render_widget(image_disabled, inner_area);
     }
+}
+
+/// Remplace la couverture quand le terminal ne sait pas afficher d'images.
+///
+/// Affiche le titre et l'avancement plutôt qu'une image dégradée. Alacritty,
+/// par exemple, n'implémente aucun protocole graphique — c'est un choix
+/// assumé de ses auteurs, pas une lacune temporaire.
+fn draw_cover_fallback(f: &mut Frame, app: &mut App, area: Rect) {
+    let (title, progress_line) = match app.current_manga() {
+        Some(manga) => {
+            let (read, total, ratio) = app.manga_progress(manga);
+            (
+                manga.name.replace('_', " "),
+                format!("{} / {} chapitres  ({:.0} %)", read, total, ratio * 100.0),
+            )
+        }
+        None => (String::from("Aucun manga sélectionné"), String::new()),
+    };
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{}", Icons::MANGA),
+            Style::default().fg(ModernColors::SECONDARY),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(ModernColors::TEXT_PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ];
+
+    if !progress_line.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            progress_line,
+            Style::default().fg(ModernColors::TEXT_SECONDARY),
+        )));
+    }
+
+    // La zone est souvent courte : l'explication n'est affichée que si elle
+    // ne risque pas de repousser le titre hors du cadre.
+    if area.height >= 9 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Couvertures indisponibles dans ce terminal",
+            Style::default().fg(ModernColors::TEXT_MUTED),
+        )));
+    }
+
+    let widget = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true });
+    f.render_widget(widget, area);
 }
 
 fn draw_modern_synopsis(f: &mut Frame, app: &mut App, area: Rect, _colors: &WallustColors) {
