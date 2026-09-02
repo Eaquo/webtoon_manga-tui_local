@@ -330,7 +330,25 @@ impl App {
                 .unwrap_or(0)
         };
 
-        let need_scan = if force || last_scan_time.is_none() {
+        // Une racine différente de celle du dernier scan rend la base
+        // caduque, quels que soient les dates et le nombre de fichiers.
+        let root_changed = {
+            let conn = db.lock().map_err(|e| anyhow::anyhow!("Failed to lock database: {}", e))?;
+            match crate::manga_indexer::last_scanned_root(&conn) {
+                Some(previous) => {
+                    let current = self.manga_dir.to_string_lossy().to_string();
+                    let changed = previous != current;
+                    if changed {
+                        debug!("Racine changée : {:?} -> {:?}", previous, current);
+                    }
+                    changed
+                }
+                // Base antérieure à cette trace : on réindexe une fois.
+                None => true,
+            }
+        };
+
+        let need_scan = if force || root_changed || last_scan_time.is_none() {
             true
         } else {
             let manga_dir = self.manga_dir.clone();
@@ -1023,8 +1041,19 @@ impl App {
                     return false;
                 }
                 KeyCode::Char('r') => {
-                    if let Ok(()) = self.force_refresh_manga_list() {
-                        self.status = "Liste des mangas actualisée".to_string();
+                    match self.force_refresh_manga_list() {
+                        Ok(()) => {
+                            let mangas = self.mangas.len();
+                            let chapitres: usize =
+                                self.mangas.iter().map(|m| m.chapters.len()).sum();
+                            self.status = format!(
+                                "Bibliothèque réindexée : {} mangas, {} chapitres",
+                                mangas, chapitres
+                            );
+                        }
+                        Err(e) => {
+                            self.status = format!("Échec de l'actualisation : {}", e);
+                        }
                     }
                     return false;
                 }
@@ -1714,7 +1743,10 @@ impl App {
                         self.manga_dir = new_path.clone();
                         self.config.last_manga_dir = Some(new_path);
                         if let Ok(()) = self.config.save() {
-                            if let Ok(()) = self.refresh_manga_list() {
+                            // Réindexation forcée : l'heuristique compare des
+                            // dates et un nombre de fichiers, elle n'a aucune
+                            // notion de « la racine a changé ».
+                            if let Ok(()) = self.force_refresh_manga_list() {
                                 self.state = AppState::BrowseManga;
                                 self.input_mode = false;
                                 self.input_field = InputField::None;
@@ -1727,7 +1759,7 @@ impl App {
                             self.manga_dir = new_path.clone();
                             self.config.last_manga_dir = Some(new_path);
                             if let Ok(()) = self.config.save() {
-                                if let Ok(()) = self.refresh_manga_list() {
+                                if let Ok(()) = self.force_refresh_manga_list() {
                                     self.state = AppState::BrowseManga;
                                     self.input_mode = false;
                                     self.input_field = InputField::None;

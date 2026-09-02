@@ -400,7 +400,31 @@ pub fn scan_and_index(conn: &Connection, root: &Path) -> Result<()> {
         }
     }
 
-    finish_scan(conn)
+    finish_scan(conn)?;
+    remember_root(conn, root)
+}
+
+/// Mémorise la racine qui vient d'être indexée.
+///
+/// Sans cette trace, un changement de dossier passait inaperçu : l'heuristique
+/// ne compare que des dates et un nombre de fichiers, deux bibliothèques
+/// distinctes pouvant très bien coïncider sur les deux.
+pub fn remember_root(conn: &Connection, root: &Path) -> Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS scan_root (id INTEGER PRIMARY KEY CHECK (id = 0), path TEXT)",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO scan_root (id, path) VALUES (0, ?1)",
+        [root.to_string_lossy().to_string()],
+    )?;
+    Ok(())
+}
+
+/// Racine indexée lors du dernier scan, si elle est connue.
+pub fn last_scanned_root(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT path FROM scan_root WHERE id = 0", [], |r| r.get(0))
+        .ok()
 }
 
 /// Enregistre l'heure du scan. Appelé aussi lors d'un abandon volontaire du
