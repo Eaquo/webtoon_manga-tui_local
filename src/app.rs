@@ -285,7 +285,21 @@ impl App {
         });
     }
 
+    /// Actualisation ordinaire : ne réindexe que si le disque a bougé.
     pub fn refresh_manga_list(&mut self) -> Result<()> {
+        self.refresh_manga_list_inner(false)
+    }
+
+    /// Actualisation demandée explicitement par l'utilisateur (touche `r`).
+    ///
+    /// Force la réindexation sans consulter l'heuristique : quand on appuie
+    /// sur « actualiser », c'est en général parce qu'on sait que quelque chose
+    /// a changé — et l'heuristique peut se tromper.
+    pub fn force_refresh_manga_list(&mut self) -> Result<()> {
+        self.refresh_manga_list_inner(true)
+    }
+
+    fn refresh_manga_list_inner(&mut self, force: bool) -> Result<()> {
         debug!("Refreshing manga list from {:?}", self.manga_dir);
         let start = Instant::now();
     
@@ -307,31 +321,58 @@ impl App {
         debug!("Last scan time: {:?}", last_scan_time);
     
         // Vérifier si un scan est nécessaire dans un thread séparé pour éviter de bloquer l'UI
-        let need_scan = if last_scan_time.is_none() {
+        // Nombre de chapitres actuellement en base, pour repérer les
+        // suppressions : effacer un fichier ne rajeunit la date d'aucun
+        // fichier restant, donc la seule comparaison des dates les manquait.
+        let known_chapters: i64 = {
+            let conn = db.lock().map_err(|e| anyhow::anyhow!("Failed to lock database: {}", e))?;
+            conn.query_row("SELECT COUNT(*) FROM chapters", [], |row| row.get(0))
+                .unwrap_or(0)
+        };
+
+        let need_scan = if force || last_scan_time.is_none() {
             true
         } else {
             let manga_dir = self.manga_dir.clone();
             let handle = thread::spawn(move || {
-                let mut needs_scan = false;
+                let mut touched = false;
+                let mut on_disk: i64 = 0;
                 for entry in WalkDir::new(&manga_dir).into_iter().filter_map(|e| e.ok()) {
-                    if entry.file_type().is_file() {
-                        if let Ok(metadata) = fs::metadata(entry.path()) {
-                            if let Ok(modified) = metadata.modified() {
-                                let modified_secs = modified
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or(Duration::from_secs(0))
-                                    .as_secs() as i64;
-                                if modified_secs > last_scan_time.unwrap_or(0) {
-                                    needs_scan = true;
-                                    break;
-                                }
+                    if !entry.file_type().is_file() {
+                        continue;
+                    }
+                    let is_chapter = entry
+                        .path()
+                        .extension()
+                        .map(|e| e == "cbz" || e == "cbr")
+                        .unwrap_or(false);
+                    if is_chapter {
+                        on_disk += 1;
+                    }
+                    if let Ok(metadata) = entry.metadata() {
+                        if let Ok(modified) = metadata.modified() {
+                            let modified_secs = modified
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or(Duration::from_secs(0))
+                                .as_secs() as i64;
+                            if modified_secs > last_scan_time.unwrap_or(0) {
+                                touched = true;
                             }
                         }
                     }
                 }
-                needs_scan
+                // Le parcours va désormais jusqu'au bout : le compte total est
+                // nécessaire, on ne peut plus s'arrêter au premier fichier récent.
+                (touched, on_disk)
             });
-            handle.join().map_err(|e| anyhow::anyhow!("Thread join failed: {:?}", e))?
+            let (touched, on_disk) = handle
+                .join()
+                .map_err(|e| anyhow::anyhow!("Thread join failed: {:?}", e))?;
+            debug!(
+                "Détection : {} chapitre(s) sur disque, {} en base, fichier récent : {}",
+                on_disk, known_chapters, touched
+            );
+            touched || on_disk != known_chapters
         };
         debug!("Need scan: {}", need_scan);
     
@@ -982,7 +1023,7 @@ impl App {
                     return false;
                 }
                 KeyCode::Char('r') => {
-                    if let Ok(()) = self.refresh_manga_list() {
+                    if let Ok(()) = self.force_refresh_manga_list() {
                         self.status = "Liste des mangas actualisée".to_string();
                     }
                     return false;

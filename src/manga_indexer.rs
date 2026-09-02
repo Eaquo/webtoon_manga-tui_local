@@ -97,6 +97,41 @@ pub fn open_db() -> Result<Connection> {
         }
     }
 
+    // Création de la table `chapters` si elle n'existe pas.
+    //
+    // Sans cela, une base vierge partait directement sur la migration
+    // ci-dessous, dont le premier geste est `ALTER TABLE chapters RENAME` :
+    // l'ordre échouait, open_db renvoyait une erreur, et une installation
+    // neuve ne pouvait donc jamais constituer sa bibliothèque.
+    let chapters_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chapters'",
+            [],
+            |row| row.get::<_, i32>(0),
+        )
+        .map(|count| count > 0)
+        .unwrap_or(false);
+
+    if !chapters_exists {
+        debug!("Table 'chapters' absente, création avec le schéma courant");
+        conn.execute(
+            "CREATE TABLE chapters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                manga_id INTEGER NOT NULL,
+                num INTEGER NOT NULL,
+                file TEXT NOT NULL,
+                read INTEGER DEFAULT 0,
+                last_page_read INTEGER,
+                full_pages_read INTEGER,
+                size INTEGER NOT NULL DEFAULT 0,
+                modified INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(manga_id, num),
+                FOREIGN KEY (manga_id) REFERENCES mangas(id)
+            )",
+            [],
+        )?;
+    }
+
     // Create or update chapters table
     let has_unique: bool = conn
         .query_row(
@@ -310,6 +345,43 @@ pub fn scan_and_index(conn: &Connection, root: &Path) -> Result<()> {
         }
     }
 
+    // Suppression des chapitres dont le fichier a disparu du disque.
+    //
+    // `found_files` était rempli au fil du parcours mais n'était jamais
+    // exploité : les chapitres supprimés restaient donc en base indéfiniment.
+    // On ne se fie qu'à ce qui vient d'être vu, la table étant entièrement
+    // reconstruite depuis `root` à chaque scan complet.
+    {
+        let mut stmt = conn.prepare("SELECT id, manga_id, num FROM chapters")?;
+        let rows: Vec<(i64, i64, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Garde-fou : ne rien supprimer si le parcours n'a rien trouvé alors
+        // que la base est peuplée. Ce cas ne traduit pas une bibliothèque vidée
+        // mais un disque non monté ou une racine erronée — et l'effacement
+        // ferait perdre l'état « lu » de toute la bibliothèque.
+        if found_files.is_empty() && !rows.is_empty() {
+            debug!(
+                "Aucun fichier trouvé alors que la base en contient {} : \
+                 nettoyage annulé (disque absent ?)",
+                rows.len()
+            );
+            return finish_scan(conn);
+        }
+
+        let mut removed = 0;
+        for (id, manga_id, num) in rows {
+            if !found_files.contains_key(&(manga_id, num)) {
+                conn.execute("DELETE FROM chapters WHERE id = ?1", [id])?;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            debug!("{} chapitre(s) retiré(s) : fichier absent du disque", removed);
+        }
+    }
+
     // Suppression des mangas dont le dossier n’existe plus
     let root_abs = fs::canonicalize(root)?;
     let existing_dirs: HashSet<String> = fs::read_dir(&root_abs)?
@@ -328,6 +400,12 @@ pub fn scan_and_index(conn: &Connection, root: &Path) -> Result<()> {
         }
     }
 
+    finish_scan(conn)
+}
+
+/// Enregistre l'heure du scan. Appelé aussi lors d'un abandon volontaire du
+/// nettoyage, pour ne pas relancer un scan complet à chaque démarrage.
+fn finish_scan(conn: &Connection) -> Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO metadata (key, value) VALUES ('last_scan_time', ?1)",
         [SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64],
